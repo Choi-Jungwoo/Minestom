@@ -21,7 +21,7 @@ public final class BedrockCompatibility {
             "3.0.0.Beta13-20260820.124150-16";
     public static final String CLOUDBURST_RAKNET_VERSION =
             "1.1.0.CR1-20260820.174333-6";
-    public static final String NETTY_VERSION = "4.2.7.Final";
+    public static final String NETTY_VERSION = "4.2.17.Final";
 
     private BedrockCompatibility() {
     }

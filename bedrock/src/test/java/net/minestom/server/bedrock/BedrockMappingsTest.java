@@ -1,5 +1,7 @@
 package net.minestom.server.bedrock;
 
+import org.cloudburstmc.nbt.NbtMap;
+import org.cloudburstmc.nbt.NbtUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -7,6 +9,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -47,20 +50,33 @@ public class BedrockMappingsTest {
         assertThrows(IllegalArgumentException.class, () -> BedrockMappings.load(directory, release));
     }
 
+    @Test
+    void rejectsMalformedCriticalNbtEvenWhenTheChecksumMatches() throws IOException {
+        writeCompleteBundle();
+        Files.write(directory.resolve("blocks.nbt"), new byte[]{1, 2, 3});
+        var release = releaseForCurrentContents();
+
+        assertThrows(IOException.class, () -> BedrockMappings.load(directory, release));
+    }
+
     private void writeCompleteBundle() throws IOException {
         for (String file : List.of(
                 "additional_offhand_items.json",
-                "block_shapes.nbt",
-                "collisions.nbt",
                 "effects.json",
                 "interactions.json",
-                "item_components.nbt",
                 "item_data_components.json",
                 "particles.json",
                 "resolvable_item_data_components.json",
                 "sounds.json",
                 "util.json")) {
-            Files.writeString(directory.resolve(file), "test fixture");
+            Files.writeString(directory.resolve(file), "{}");
+        }
+        for (String file : List.of(
+                "block_shapes.nbt", "blocks.nbt", "collisions.nbt", "item_components.nbt")) {
+            try (var output = Files.newOutputStream(directory.resolve(file));
+                 var writer = NbtUtils.createGZIPWriter(output)) {
+                writer.writeTag(NbtMap.fromMap(Map.of("entry", 1)));
+            }
         }
         Files.writeString(directory.resolve("README.md"), """
                 Generated for Minecraft: Java Edition 26.2 and Minecraft: Bedrock Edition 1.26.30.5.
@@ -69,7 +85,6 @@ public class BedrockMappingsTest {
         Files.writeString(directory.resolve("biomes.json"), """
                 {"minecraft:plains":{"bedrock_id":1}}
                 """);
-        Files.write(directory.resolve("blocks.nbt"), new byte[]{1, 2, 3});
         Files.writeString(directory.resolve("items.json"), """
                 {"minecraft:air":{"bedrock_identifier":"minecraft:air"}}
                 """);

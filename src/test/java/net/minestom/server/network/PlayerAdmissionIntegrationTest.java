@@ -85,6 +85,31 @@ public class PlayerAdmissionIntegrationTest {
     }
 
     @Test
+    void rejectsAProfileAlreadyAdmittedByAnotherProtocol(Env env) {
+        final ConnectionManager connectionManager = env.process().connection();
+        final GameProfile sharedProfile = profile("SharedIdentity");
+        final AtomicInteger providerCalls = new AtomicInteger();
+        connectionManager.setPlayerProvider((connection, profile) -> {
+            providerCalls.incrementAndGet();
+            return new Player(connection, profile);
+        });
+        final PlayerAdmission admission = admission(_ -> {
+        }, _ -> {
+        });
+
+        connectionManager.admitPlayer(
+                new RecordingConnection(), sharedProfile, admission).join();
+        final CompletableFuture<Player> duplicateName = connectionManager.admitPlayer(
+                new RecordingConnection(), profile("sharedidentity"), admission);
+        final CompletableFuture<Player> duplicateUuid = connectionManager.admitPlayer(
+                new RecordingConnection(), new GameProfile(sharedProfile.uuid(), "OtherIdentity"), admission);
+
+        assertThrows(CompletionException.class, duplicateName::join);
+        assertThrows(CompletionException.class, duplicateUuid::join);
+        assertEquals(1, providerCalls.get());
+    }
+
+    @Test
     void rejectionDoesNotCreatePlayer(Env env) {
         final ConnectionManager connectionManager = env.process().connection();
         final RecordingConnection connection = new RecordingConnection();

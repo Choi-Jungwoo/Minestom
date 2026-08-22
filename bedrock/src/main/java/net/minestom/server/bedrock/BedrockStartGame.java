@@ -2,6 +2,7 @@ package net.minestom.server.bedrock;
 
 import net.minestom.server.entity.Player;
 import net.minestom.server.instance.Instance;
+import net.minestom.server.world.DimensionType;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.math.vector.Vector3i;
@@ -22,10 +23,14 @@ final class BedrockStartGame {
     }
 
     static StartGamePacket create(
-            Player player, Instance instance, BedrockMappings mappings) {
+            Player player, Instance instance, BedrockMappings mappings, int protocolVersion) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(instance, "instance");
         Objects.requireNonNull(mappings, "mappings");
+        mappings.requireAcceptedProtocol(protocolVersion);
+        if (mappings.registryEntryCount() == 0) {
+            throw new IllegalStateException("Bedrock mappings have no validated registry entries");
+        }
 
         final var position = player.getRespawnPoint();
         final long entityId = player.getEntityId();
@@ -75,10 +80,9 @@ final class BedrockStartGame {
     }
 
     private static int dimensionId(Instance instance) {
-        return switch (instance.getDimensionType().name()) {
-            case "minecraft:the_nether" -> 1;
-            case "minecraft:the_end" -> 2;
-            default -> 0;
-        };
+        final DimensionType dimensionType = instance.getCachedDimensionType();
+        if (dimensionType.cardinalLight() == DimensionType.CardinalLight.NETHER) return 1;
+        if (dimensionType.skybox() == DimensionType.Skybox.END) return 2;
+        return 0;
     }
 }

@@ -15,6 +15,7 @@ dependencies {
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)
     implementation(libs.netty.transport)
+    implementation(libs.gson)
 
     implementation(libs.cloudburst.common) {
         exclude(group = "io.netty")

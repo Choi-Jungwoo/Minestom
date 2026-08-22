@@ -84,24 +84,27 @@ public final class BedrockConnection extends PlayerConnection {
 
     @Override
     public void kick(Component component) {
-        if (disconnected.compareAndSet(false, true)) {
+        disconnectOnce(() -> {
             final DisconnectPacket packet = new DisconnectPacket();
             packet.setKickMessage(LEGACY.serialize(component));
             session.sendPacketImmediately(packet);
             session.disconnect(packet.getKickMessage());
-            super.disconnect();
-        }
+        });
     }
 
     @Override
     public void disconnect() {
-        if (disconnected.compareAndSet(false, true)) {
-            session.disconnect("Disconnected");
-            super.disconnect();
-        }
+        disconnectOnce(() -> session.disconnect("Disconnected"));
     }
 
     void peerDisconnected() {
-        if (disconnected.compareAndSet(false, true)) super.disconnect();
+        disconnectOnce(() -> {
+        });
+    }
+
+    private void disconnectOnce(Runnable notifyPeer) {
+        if (!disconnected.compareAndSet(false, true)) return;
+        notifyPeer.run();
+        super.disconnect();
     }
 }

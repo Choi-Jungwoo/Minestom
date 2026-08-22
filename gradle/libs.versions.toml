@@ -11,7 +11,7 @@ cloudburstConnection = "3.0.0.Beta13-20260814.192942-15"
 cloudburstCommon = "3.0.0.Beta13-20260814.192942-15"
 cloudburstCodec = "3.0.0.Beta13-20260820.124150-16"
 cloudburstRaknet = "1.1.0.CR1-20260820.174333-6"
-netty = "4.2.7.Final"
+netty = "4.2.17.Final"
 
 # Performance / Data Structures
 fastutil = "8.5.19"

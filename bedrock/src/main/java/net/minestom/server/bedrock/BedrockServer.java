@@ -70,6 +70,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Owns the process-level Bedrock UDP listener.
@@ -79,7 +80,9 @@ public final class BedrockServer {
     private static final long SHUTDOWN_DRAIN_MILLIS = 100;
     private static final int MAX_CONCURRENT_PINGS = 64;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
-    private static final String SUPPORTED_PROTOCOLS = "924, 944, 975, 1001, 2168";
+    private static final String ACCEPTED_PROTOCOLS = BedrockCompatibility.ACCEPTED_PROTOCOLS.stream()
+            .map(String::valueOf)
+            .collect(Collectors.joining(", "));
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacySection();
     private static final Map<Integer, BedrockCodec> CODECS = Map.of(
             924, Bedrock_v924.CODEC,
@@ -88,6 +91,13 @@ public final class BedrockServer {
             1001, Bedrock_v1001.CODEC,
             2168, Bedrock_v2168.CODEC);
     private static final IdentityHashMap<ServerProcess, BedrockServer> INSTANCES = new IdentityHashMap<>();
+
+    static {
+        if (!CODECS.keySet().equals(Set.copyOf(BedrockCompatibility.ACCEPTED_PROTOCOLS))) {
+            throw new ExceptionInInitializerError(
+                    "Bedrock accepted protocols do not match the available codecs");
+        }
+    }
 
     private final ServerProcess process;
     private final GlobalEventHandler eventHandler;
@@ -392,10 +402,7 @@ public final class BedrockServer {
     private static final class HandshakeHandler implements BedrockPacketHandler {
         private final BedrockServer server;
         private final BedrockServerSession session;
-        private boolean networkSettingsRequested;
-        private boolean loginAccepted;
-        private boolean encryptionConfirmed;
-        private boolean resourcePacksCompleted;
+        private HandshakePhase phase = HandshakePhase.INITIAL;
         private @Nullable IdentityReservation identity;
         private @Nullable BedrockConnection connection;
 
@@ -406,17 +413,16 @@ public final class BedrockServer {
 
         @Override
         public PacketSignal handle(RequestNetworkSettingsPacket request) {
-            if (networkSettingsRequested) {
+            if (phase != HandshakePhase.INITIAL) {
                 session.disconnect("Network settings were already requested");
                 return PacketSignal.HANDLED;
             }
-            networkSettingsRequested = true;
 
             final int protocolVersion = request.getProtocolVersion();
             final BedrockCodec codec = CODECS.get(protocolVersion);
             if (codec == null) {
                 session.disconnect("Unsupported Bedrock protocol " + protocolVersion +
-                        "; expected one of " + SUPPORTED_PROTOCOLS);
+                        "; expected one of " + ACCEPTED_PROTOCOLS);
                 return PacketSignal.HANDLED;
             }
 
@@ -426,12 +432,13 @@ public final class BedrockServer {
             response.setCompressionThreshold(512);
             session.sendPacketImmediately(response);
             session.setCompression(PacketCompressionAlgorithm.ZLIB);
+            phase = HandshakePhase.NETWORK_SETTINGS;
             return PacketSignal.HANDLED;
         }
 
         @Override
         public PacketSignal handle(LoginPacket login) {
-            if (!networkSettingsRequested || loginAccepted
+            if (phase != HandshakePhase.NETWORK_SETTINGS
                     || login.getProtocolVersion() != session.getCodec().getProtocolVersion()) {
                 session.disconnect("Invalid Bedrock login sequence");
                 return PacketSignal.HANDLED;
@@ -453,7 +460,7 @@ public final class BedrockServer {
                 session.sendPacketImmediately(handshake);
                 session.enableEncryption(EncryptionUtils.getSecretKey(
                         serverKeyPair.getPrivate(), verified.clientKey(), token));
-                loginAccepted = true;
+                phase = HandshakePhase.LOGIN;
             } catch (Exception _) {
                 session.disconnect("Invalid Bedrock login");
             }
@@ -462,11 +469,11 @@ public final class BedrockServer {
 
         @Override
         public PacketSignal handle(ClientToServerHandshakePacket packet) {
-            if (!loginAccepted || encryptionConfirmed) {
+            if (phase != HandshakePhase.LOGIN) {
                 session.disconnect("Invalid Bedrock encryption handshake");
                 return PacketSignal.HANDLED;
             }
-            encryptionConfirmed = true;
+            phase = HandshakePhase.ENCRYPTED;
 
             final PlayStatusPacket status = new PlayStatusPacket();
             status.setStatus(PlayStatusPacket.Status.LOGIN_SUCCESS);
@@ -485,26 +492,36 @@ public final class BedrockServer {
 
         @Override
         public PacketSignal handle(ResourcePackClientResponsePacket response) {
-            if (!encryptionConfirmed || resourcePacksCompleted) {
+            if (phase != HandshakePhase.ENCRYPTED && phase != HandshakePhase.PACK_STACK) {
                 session.disconnect("Invalid Bedrock resource-pack handshake");
                 return PacketSignal.HANDLED;
             }
 
             switch (response.getStatus()) {
                 case HAVE_ALL_PACKS -> {
+                    if (phase != HandshakePhase.ENCRYPTED) {
+                        session.disconnect("Invalid Bedrock resource-pack handshake");
+                        return PacketSignal.HANDLED;
+                    }
                     final ResourcePackStackPacket stack = new ResourcePackStackPacket();
                     stack.setForcedToAccept(false);
                     stack.setGameVersion(session.getCodec().getMinecraftVersion());
                     stack.setExperimentsPreviouslyToggled(false);
                     stack.setHasEditorPacks(false);
                     session.sendPacket(stack);
+                    phase = HandshakePhase.PACK_STACK;
                 }
                 case COMPLETED -> {
-                    resourcePacksCompleted = true;
+                    if (phase != HandshakePhase.PACK_STACK) {
+                        session.disconnect("Invalid Bedrock resource-pack handshake");
+                        return PacketSignal.HANDLED;
+                    }
+                    phase = HandshakePhase.ADMITTED;
                     admitPlayer();
                 }
                 case SEND_PACKS -> {
-                    if (!response.getPackIds().isEmpty()) {
+                    if (phase != HandshakePhase.ENCRYPTED
+                            || !response.getPackIds().isEmpty()) {
                         session.disconnect("This server has no Bedrock resource packs");
                     }
                 }
@@ -544,7 +561,10 @@ public final class BedrockServer {
                     connection.setClientState(ConnectionState.PLAY);
                     connection.setServerState(ConnectionState.PLAY);
                     connection.sendBedrockPacket(BedrockStartGame.create(
-                            player, server.config.spawningInstance(), mappings));
+                            player,
+                            server.config.spawningInstance(),
+                            mappings,
+                            connection.getProtocolVersion()));
                     return CompletableFuture.completedFuture(null);
                 }
             };
@@ -556,6 +576,15 @@ public final class BedrockServer {
                         return null;
                     });
         }
+    }
+
+    private enum HandshakePhase {
+        INITIAL,
+        NETWORK_SETTINGS,
+        LOGIN,
+        ENCRYPTED,
+        PACK_STACK,
+        ADMITTED
     }
 
     private IdentityReservation reserveIdentity(String name, UUID uuid) {

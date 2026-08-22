@@ -1,5 +1,9 @@
 package net.minestom.server.bedrock;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import org.cloudburstmc.nbt.NbtUtils;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -7,8 +11,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 final class BedrockMappings {
@@ -29,22 +36,28 @@ final class BedrockMappings {
             "resolvable_item_data_components.json",
             "sounds.json",
             "util.json");
+    private static final List<String> JSON_FILES =
+            REQUIRED_FILES.stream().filter(file -> file.endsWith(".json")).toList();
+    private static final List<String> NBT_FILES =
+            REQUIRED_FILES.stream().filter(file -> file.endsWith(".nbt")).toList();
     static final Release SUPPORTED_RELEASE = new Release(
             BedrockCompatibility.JAVA_VERSION,
             BedrockCompatibility.BEDROCK_MAPPING_VERSION,
             BedrockCompatibility.MAPPING_SHA256);
 
     private final Release release;
+    private final int registryEntryCount;
 
-    private BedrockMappings(Release release) {
+    private BedrockMappings(Release release, int registryEntryCount) {
         this.release = release;
+        this.registryEntryCount = registryEntryCount;
     }
 
     static BedrockMappings testing() {
         return new BedrockMappings(new Release(
                 BedrockCompatibility.JAVA_VERSION,
                 BedrockCompatibility.BEDROCK_MAPPING_VERSION,
-                "0000000000000000000000000000000000000000000000000000000000000000"));
+                "0000000000000000000000000000000000000000000000000000000000000000"), 1);
     }
 
     static BedrockMappings load(Path directory) throws IOException {
@@ -73,8 +86,8 @@ final class BedrockMappings {
                             + ", got " + actualChecksum);
         }
         validateReleaseIdentity(root, release);
-        validateRegistryCoverage(root);
-        return new BedrockMappings(release);
+        final int registryEntryCount = validateRegistryCoverage(root);
+        return new BedrockMappings(release, registryEntryCount);
     }
 
     static String sha256(Path directory, List<String> files) throws IOException {
@@ -106,15 +119,49 @@ final class BedrockMappings {
         }
     }
 
-    private static void validateRegistryCoverage(Path root) throws IOException {
-        final String biomes = Files.readString(root.resolve("biomes.json"));
-        final String items = Files.readString(root.resolve("items.json"));
-        if (!biomes.contains("\"minecraft:plains\"") || !biomes.contains("\"bedrock_id\"")) {
+    private static int validateRegistryCoverage(Path root) throws IOException {
+        final Map<String, JsonElement> jsonMappings = new HashMap<>();
+        int registryEntryCount = 0;
+        for (String file : JSON_FILES) {
+            final JsonElement json;
+            try (var reader = Files.newBufferedReader(root.resolve(file))) {
+                json = JsonParser.parseReader(reader);
+            } catch (RuntimeException exception) {
+                throw new IllegalArgumentException("Bedrock mapping JSON is invalid: " + file, exception);
+            }
+            if (json.isJsonObject()) registryEntryCount += json.getAsJsonObject().size();
+            else if (json.isJsonArray()) registryEntryCount += json.getAsJsonArray().size();
+            jsonMappings.put(file, json);
+        }
+
+        final JsonElement biomes = jsonMappings.get("biomes.json");
+        final JsonElement items = jsonMappings.get("items.json");
+        if (!biomes.isJsonObject() || !biomes.getAsJsonObject().has("minecraft:plains")) {
             throw new IllegalArgumentException("Bedrock mappings are missing the plains biome");
         }
-        if (!items.contains("\"minecraft:air\"") || !items.contains("\"bedrock_identifier\"")) {
+        if (!items.isJsonObject() || !items.getAsJsonObject().has("minecraft:air")) {
             throw new IllegalArgumentException("Bedrock mappings are missing the air item");
         }
+        for (String file : NBT_FILES) {
+            final Object rootTag;
+            try (var input = Files.newInputStream(root.resolve(file));
+                 var reader = NbtUtils.createGZIPReader(input)) {
+                rootTag = reader.readTag();
+            }
+            final int size = switch (rootTag) {
+                case Map<?, ?> map -> map.size();
+                case Collection<?> collection -> collection.size();
+                case null, default -> 0;
+            };
+            if (size == 0) {
+                throw new IllegalArgumentException("Bedrock mapping NBT is empty: " + file);
+            }
+            registryEntryCount += size;
+        }
+        if (registryEntryCount == 0) {
+            throw new IllegalArgumentException("Bedrock mappings contain no registry entries");
+        }
+        return registryEntryCount;
     }
 
     String javaVersion() {
@@ -127,6 +174,18 @@ final class BedrockMappings {
 
     String sha256() {
         return release.sha256();
+    }
+
+    int registryEntryCount() {
+        return registryEntryCount;
+    }
+
+    void requireAcceptedProtocol(int protocolVersion) {
+        if (!BedrockCompatibility.ACCEPTED_PROTOCOLS.contains(protocolVersion)) {
+            throw new IllegalArgumentException(
+                    "Mappings " + bedrockVersion()
+                            + " cannot be used with Bedrock protocol " + protocolVersion);
+        }
     }
 
     record Release(String javaVersion, String bedrockVersion, String sha256) {

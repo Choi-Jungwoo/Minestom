@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -69,6 +70,8 @@ public final class ConnectionManager {
     private final Map<PlayerConnection, Player> connectionPlayerMap = new ConcurrentHashMap<>();
     // Connections currently moving through the protocol-neutral admission lifecycle.
     private final Map<PlayerConnection, AdmissionState> playerAdmissions = new ConcurrentHashMap<>();
+    // Final profiles reserved between pre-login and Player creation.
+    private final Set<AdmissionIdentity> admissionIdentities = new HashSet<>();
     private volatile boolean acceptingAdmissions = true;
     // Players waiting to be spawned (post configuration state)
     private final MessagePassingQueue<Player> playWaitingPlayers = ConcurrentMessageQueues.mpscUnboundedArrayQueue(64);
@@ -192,7 +195,7 @@ public final class ConnectionManager {
     }
 
     @ApiStatus.Internal
-    public Player createPlayer(PlayerConnection connection, GameProfile gameProfile) {
+    public synchronized Player createPlayer(PlayerConnection connection, GameProfile gameProfile) {
         assert ServerFlag.INSIDE_TEST || Thread.currentThread().isVirtual();
         final Player player = Objects.requireNonNull(
                 playerProvider.createPlayer(connection, gameProfile), "PlayerProvider returned null");
@@ -273,10 +276,15 @@ public final class ConnectionManager {
                 throw new CancellationException("Connection closed during pre-login");
             }
 
-            awaitAdmissionPhase(state, admission.accept(finalProfile), timeout, unit);
-            ensureAdmissionActive(state);
-
-            final Player player = createPlayer(state.connection, finalProfile);
+            final Player player;
+            final AdmissionIdentity identity = reserveAdmissionIdentity(finalProfile);
+            try {
+                awaitAdmissionPhase(state, admission.accept(finalProfile), timeout, unit);
+                ensureAdmissionActive(state);
+                player = createPlayer(state.connection, finalProfile);
+            } finally {
+                releaseAdmissionIdentity(identity);
+            }
             if (state.operation.isDone()) {
                 rollbackAdmission(state.connection);
                 return;
@@ -290,6 +298,26 @@ public final class ConnectionManager {
             if (throwable instanceof InterruptedException) Thread.currentThread().interrupt();
             state.operation.completeExceptionally(throwable);
         }
+    }
+
+    private synchronized AdmissionIdentity reserveAdmissionIdentity(GameProfile gameProfile) {
+        final AdmissionIdentity identity = AdmissionIdentity.from(gameProfile);
+        for (Player existing : connectionPlayerMap.values()) {
+            if (identity.matches(existing)) throw duplicateIdentity();
+        }
+        for (AdmissionIdentity reserved : admissionIdentities) {
+            if (identity.conflictsWith(reserved)) throw duplicateIdentity();
+        }
+        admissionIdentities.add(identity);
+        return identity;
+    }
+
+    private synchronized void releaseAdmissionIdentity(AdmissionIdentity identity) {
+        admissionIdentities.remove(identity);
+    }
+
+    private static IllegalArgumentException duplicateIdentity() {
+        return new IllegalArgumentException("A player with this name or UUID is already connected");
     }
 
     private static void awaitAdmissionPhase(AdmissionState state, CompletableFuture<Void> phase,
@@ -622,6 +650,21 @@ public final class ConnectionManager {
         private void cancelPhase() {
             final CompletableFuture<Void> current = phase.getAndSet(null);
             if (current != null) current.cancel(true);
+        }
+    }
+
+    private record AdmissionIdentity(String username, UUID uuid) {
+        private static AdmissionIdentity from(GameProfile profile) {
+            return new AdmissionIdentity(profile.name().toLowerCase(Locale.ROOT), profile.uuid());
+        }
+
+        private boolean matches(Player player) {
+            return username.equals(player.getUsername().toLowerCase(Locale.ROOT))
+                    || uuid.equals(player.getUuid());
+        }
+
+        private boolean conflictsWith(AdmissionIdentity identity) {
+            return username.equals(identity.username) || uuid.equals(identity.uuid);
         }
     }
 
