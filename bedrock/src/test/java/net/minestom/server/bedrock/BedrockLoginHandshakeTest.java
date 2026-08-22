@@ -2,10 +2,13 @@ package net.minestom.server.bedrock;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.util.ResourceLeakDetector;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import net.kyori.adventure.text.Component;
 import net.minestom.server.MinecraftServer;
@@ -117,10 +120,12 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockLoginHandshakeTest {
     private static final byte[] CLASSIC_SKIN = classicSkin(64, 64);
+    private static final Object LEAK_DETECTOR_LOCK = new Object();
 
     private ServerProcess process;
     private BedrockServer server;
@@ -710,6 +715,24 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    void configuredTotalConnectionLimitRejectsASecondRakNetSession() throws Exception {
+        restartServer(new BedrockServerLimits(
+                1,
+                20,
+                1400,
+                1_048_576,
+                2_097_152,
+                8_388_608,
+                256,
+                1_048_576));
+        try (var first = new LoginClient(
+                server.boundAddress(), "Capacity", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            assertTrue(first.session.isConnected());
+            assertRakNetConnectionRejected(server.boundAddress());
+        }
+    }
+
+    @Test
     void configuredPerTickLimitRejectsExcessInboundWork() throws Exception {
         restartServer(new BedrockServerLimits(
                 32,
@@ -764,41 +787,54 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
-    void handshakeLoginAndAdmittedSessionChurnLeavesNoPlayersBehind() throws Exception {
-        for (int index = 0; index < 2; index++) {
-            final LoginClient interrupted = new LoginClient(
-                    server.boundAddress(),
-                    "HandshakeInterrupted" + index,
-                    AuthType.SELF_SIGNED,
-                    Credentials.VALID);
-            // Closing before RequestNetworkSettings simulates interruption during handshake.
-            interrupted.close();
-        }
+    void longSessionChurnRunsWithParanoidLeakDetection() throws Exception {
+        synchronized (LEAK_DETECTOR_LOCK) {
+            final ResourceLeakDetector.Level previous = ResourceLeakDetector.getLevel();
+            ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+            try {
+                for (int index = 0; index < 8; index++) {
+                    final LoginClient interrupted = new LoginClient(
+                            server.boundAddress(),
+                            "HandshakeInterrupted" + index,
+                            AuthType.SELF_SIGNED,
+                            Credentials.VALID);
+                    // Closing before RequestNetworkSettings simulates interruption during handshake.
+                    interrupted.close();
+                }
 
-        for (int index = 0; index < 2; index++) {
-            final LoginClient interrupted = new LoginClient(
-                    server.boundAddress(),
-                    "LoginInterrupted" + index,
-                    AuthType.SELF_SIGNED,
-                    Credentials.VALID);
-            interrupted.sendLogin = false;
-            interrupted.begin();
-            assertTrue(awaitCondition(() ->
-                    interrupted.stage.equals("received network settings")));
-            interrupted.close();
-        }
+                for (int index = 0; index < 8; index++) {
+                    final LoginClient interrupted = new LoginClient(
+                            server.boundAddress(),
+                            "LoginInterrupted" + index,
+                            AuthType.SELF_SIGNED,
+                            Credentials.VALID);
+                    interrupted.sendLogin = false;
+                    interrupted.begin();
+                    assertTrue(awaitCondition(() ->
+                            interrupted.stage.equals("received network settings")));
+                    interrupted.close();
+                }
 
-        for (int index = 0; index < 4; index++) {
-            try (var admitted = new LoginClient(
-                    server.boundAddress(),
-                    "Churn" + index,
-                    AuthType.SELF_SIGNED,
-                    Credentials.VALID)) {
-                admitted.begin();
-                assertTrue(admitted.completed.await(3, TimeUnit.SECONDS), () -> admitted.stage);
-                awaitPlayer();
+                for (int index = 0; index < 16; index++) {
+                    try (var admitted = new LoginClient(
+                            server.boundAddress(),
+                            "Churn" + index,
+                            AuthType.SELF_SIGNED,
+                            Credentials.VALID)) {
+                        admitted.begin();
+                        assertTrue(admitted.completed.await(3, TimeUnit.SECONDS), () -> admitted.stage);
+                        awaitPlayer();
+                        for (int tick = 1; tick <= 32; tick++) {
+                            admitted.move(new Pos(0, 42, 0), tick);
+                            tick();
+                        }
+                        assertEquals(1, process.connection().getOnlinePlayerCount());
+                    }
+                    assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+                }
+            } finally {
+                ResourceLeakDetector.setLevel(previous);
             }
-            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
         }
     }
 
@@ -882,6 +918,32 @@ public class BedrockLoginHandshakeTest {
             Thread.sleep(10);
         }
         return condition.getAsBoolean();
+    }
+
+    private static void assertRakNetConnectionRejected(InetSocketAddress address) {
+        final EventLoopGroup group = new MultiThreadIoEventLoopGroup(
+                1,
+                new DefaultThreadFactory("bedrock-capacity-client", true),
+                NioIoHandler.newFactory());
+        ChannelFuture connection = null;
+        try {
+            connection = new Bootstrap()
+                    .group(group)
+                    .channelFactory(RakChannelFactory.client(NioDatagramChannel.class))
+                    .option(
+                            RakChannelOption.RAK_PROTOCOL_VERSION,
+                            Bedrock_v1001.CODEC.getRaknetProtocolVersion())
+                    .option(RakChannelOption.RAK_CONNECT_TIMEOUT, 2_000L)
+                    .option(RakChannelOption.RAK_MAX_CONNECTION_ATTEMPTS, 2)
+                    .option(RakChannelOption.RAK_TIME_BETWEEN_SEND_CONNECTION_ATTEMPTS_MS, 50)
+                    .handler(new ChannelInboundHandlerAdapter())
+                    .connect(address);
+            final ChannelFuture rejected = connection;
+            assertThrows(Exception.class, rejected::sync);
+        } finally {
+            if (connection != null) connection.channel().close().syncUninterruptibly();
+            group.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
+        }
     }
 
     private void tick() {

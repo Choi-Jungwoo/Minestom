@@ -15,13 +15,35 @@ public class BedrockConnectionThrottleTest {
                 new BedrockConnectionThrottle(2, 32, new BedrockDiagnostics());
         final InetSocketAddress first =
                 new InetSocketAddress(InetAddress.getByName("192.0.2.1"), 19132);
+        final InetSocketAddress firstRetry =
+                new InetSocketAddress(InetAddress.getByName("192.0.2.1"), 19133);
+        final InetSocketAddress firstRejected =
+                new InetSocketAddress(InetAddress.getByName("192.0.2.1"), 19134);
         final InetSocketAddress second =
                 new InetSocketAddress(InetAddress.getByName("192.0.2.2"), 19132);
 
         assertTrue(throttle.accept(first));
-        assertTrue(throttle.accept(first));
         throttle.closed(first);
-        assertFalse(throttle.accept(first));
+        assertTrue(throttle.accept(firstRetry));
+        throttle.closed(firstRetry);
+        assertFalse(throttle.accept(firstRejected));
+        assertTrue(throttle.accept(second));
+    }
+
+    @Test
+    void releasesConnectionCapacityWhenAChildCloses() throws Exception {
+        final BedrockConnectionThrottle throttle =
+                new BedrockConnectionThrottle(20, 1, new BedrockDiagnostics());
+        final InetSocketAddress first =
+                new InetSocketAddress(InetAddress.getByName("192.0.2.1"), 19132);
+        final InetSocketAddress second =
+                new InetSocketAddress(InetAddress.getByName("192.0.2.2"), 19132);
+
+        assertTrue(throttle.accept(first));
+        assertFalse(throttle.accept(second));
+
+        throttle.closed(first);
+
         assertTrue(throttle.accept(second));
     }
 }
