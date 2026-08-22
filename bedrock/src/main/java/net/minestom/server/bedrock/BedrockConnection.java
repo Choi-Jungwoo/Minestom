@@ -10,16 +10,20 @@ import net.minestom.server.coordinate.Pos;
 import net.minestom.server.entity.EntityType;
 import net.minestom.server.entity.EquipmentSlot;
 import net.minestom.server.entity.Player;
+import net.minestom.server.event.EventDispatcher;
+import net.minestom.server.event.player.OutgoingTransferEvent;
 import net.minestom.server.instance.Chunk;
 import net.minestom.server.instance.Instance;
 import net.minestom.server.item.ItemStack;
 import net.minestom.server.network.ConnectionState;
+import net.minestom.server.network.packet.client.common.ClientKeepAlivePacket;
 import net.minestom.server.network.packet.client.play.ClientChatMessagePacket;
 import net.minestom.server.network.packet.client.play.ClientCommandChatPacket;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
 import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
 import net.minestom.server.network.packet.server.CachedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
+import net.minestom.server.network.packet.server.common.KeepAlivePacket;
 import net.minestom.server.network.packet.server.play.BlockChangePacket;
 import net.minestom.server.network.packet.server.play.DestroyEntitiesPacket;
 import net.minestom.server.network.packet.server.play.EntityEquipmentPacket;
@@ -57,12 +61,12 @@ import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.CommandRequestPacket;
-import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MobArmorEquipmentPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkChunkPublisherUpdatePacket;
+import org.cloudburstmc.protocol.bedrock.packet.NetworkStackLatencyPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
@@ -70,6 +74,7 @@ import org.cloudburstmc.protocol.bedrock.packet.PlayerListPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
+import org.cloudburstmc.protocol.bedrock.packet.TransferPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.jetbrains.annotations.Nullable;
 
@@ -159,7 +164,9 @@ public final class BedrockConnection extends PlayerConnection {
             return;
         }
         try {
-            if (packet instanceof BlockChangePacket change) {
+            if (packet instanceof KeepAlivePacket keepAlive) {
+                sendKeepAlive(keepAlive);
+            } else if (packet instanceof BlockChangePacket change) {
                 sendBlockUpdate(
                         change.blockPosition().blockX(),
                         change.blockPosition().blockY(),
@@ -300,6 +307,12 @@ public final class BedrockConnection extends PlayerConnection {
         player.addPacketToQueue(new ClientCommandChatPacket(command));
     }
 
+    void handle(NetworkStackLatencyPacket packet) {
+        final Player player = getPlayer();
+        if (player == null || packet.isFromServer()) return;
+        player.addPacketToQueue(new ClientKeepAlivePacket(packet.getTimestamp()));
+    }
+
     void handleDimensionChangeSuccess() {
         final int previous = pendingDimensionChanges.getAndUpdate(
                 current -> Math.max(0, current - 1));
@@ -331,12 +344,7 @@ public final class BedrockConnection extends PlayerConnection {
 
     @Override
     public void kick(Component component) {
-        disconnectOnce(() -> {
-            final DisconnectPacket packet = new DisconnectPacket();
-            packet.setKickMessage(LEGACY.serialize(component));
-            session.sendPacketImmediately(packet);
-            session.disconnect(packet.getKickMessage());
-        });
+        disconnectOnce(() -> session.disconnect(LEGACY.serialize(component)));
     }
 
     @Override
@@ -344,9 +352,19 @@ public final class BedrockConnection extends PlayerConnection {
         disconnectOnce(() -> session.disconnect("Disconnected"));
     }
 
-    void peerDisconnected() {
-        disconnectOnce(() -> {
+    @Override
+    public void transfer(String host, int port) {
+        final OutgoingTransferEvent event = new OutgoingTransferEvent(getPlayer(), host, port);
+        EventDispatcher.callCancellable(event, () -> {
+            final TransferPacket packet = new TransferPacket();
+            packet.setAddress(event.getHost());
+            packet.setPort(event.getPort());
+            sendBedrockPacket(packet);
         });
+    }
+
+    void peerDisconnected() {
+        disconnectOnce();
     }
 
     private void sendChunkPublisherUpdate(UpdateViewPositionPacket view) {
@@ -360,6 +378,13 @@ public final class BedrockConnection extends PlayerConnection {
                 view.chunkZ() * Chunk.CHUNK_SIZE_Z + Chunk.CHUNK_SIZE_Z / 2));
         update.setRadius(player.getInstance().viewDistance() * Chunk.CHUNK_SIZE_X);
         sendBedrockPacket(update);
+    }
+
+    private void sendKeepAlive(KeepAlivePacket keepAlive) {
+        final NetworkStackLatencyPacket packet = new NetworkStackLatencyPacket();
+        packet.setTimestamp(keepAlive.id());
+        packet.setFromServer(true);
+        sendBedrockPacket(packet);
     }
 
     private void sendBlockUpdates(MultiBlockChangePacket changes) {
@@ -723,7 +748,15 @@ public final class BedrockConnection extends PlayerConnection {
 
     private void disconnectOnce(Runnable notifyPeer) {
         if (!disconnected.compareAndSet(false, true)) return;
-        notifyPeer.run();
+        try {
+            notifyPeer.run();
+        } finally {
+            super.disconnect();
+        }
+    }
+
+    private void disconnectOnce() {
+        if (!disconnected.compareAndSet(false, true)) return;
         super.disconnect();
     }
 }

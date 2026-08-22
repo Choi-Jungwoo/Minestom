@@ -101,6 +101,25 @@ public class BedrockDiscoveryTest {
         }
     }
 
+    @Test
+    void malformedUdpFloodDoesNotPreventSubsequentDiscovery() throws Exception {
+        process = MinecraftServer.updateProcess();
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server.start();
+
+        try (var socket = new DatagramSocket(0, InetAddress.getLoopbackAddress())) {
+            for (int index = 0; index < 256; index++) {
+                final byte[] malformed = new byte[index % 2 == 0 ? 64 : 2_048];
+                malformed[0] = (byte) index;
+                socket.send(new DatagramPacket(
+                        malformed, malformed.length, server.boundAddress()));
+            }
+        }
+
+        assertEquals(1001, discover(server.boundAddress()).protocolVersion());
+    }
+
     private static BedrockPong discover(InetSocketAddress address) throws Exception {
         try (var socket = new DatagramSocket(0, InetAddress.getLoopbackAddress())) {
             socket.setSoTimeout(2_000);

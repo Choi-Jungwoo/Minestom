@@ -15,6 +15,8 @@ dependencies {
     implementation(libs.netty.codec)
     implementation(libs.netty.handler)
     implementation(libs.netty.transport)
+    implementation(libs.netty.transport.classes.epoll)
+    implementation(libs.netty.transport.classes.kqueue)
     implementation(libs.gson)
 
     implementation(libs.cloudburst.common) {

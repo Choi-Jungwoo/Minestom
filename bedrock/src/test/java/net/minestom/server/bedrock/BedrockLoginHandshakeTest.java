@@ -19,6 +19,7 @@ import net.minestom.server.entity.EquipmentSlot;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
 import net.minestom.server.event.player.PlayerChatEvent;
+import net.minestom.server.event.player.PlayerDisconnectEvent;
 import net.minestom.server.event.player.PlayerMoveEvent;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.item.ItemStack;
@@ -63,6 +64,7 @@ import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
+import org.cloudburstmc.protocol.bedrock.packet.NetworkStackLatencyPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
@@ -76,6 +78,7 @@ import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
+import org.cloudburstmc.protocol.bedrock.packet.TransferPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
@@ -103,6 +106,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -579,6 +583,180 @@ public class BedrockLoginHandshakeTest {
         }
     }
 
+    @Test
+    void bedrockKeepAliveUpdatesTheAuthoritativePlayerLatency() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "Latency", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+
+            tick();
+
+            final NetworkStackLatencyPacket latency = client.latencies.poll(3, TimeUnit.SECONDS);
+            assertNotNull(latency);
+            assertEquals(player.getLastKeepAlive(), latency.getTimestamp());
+            assertTrue(tickUntil(player::didAnswerKeepAlive));
+            assertTrue(player.getLatency() >= 0);
+        }
+    }
+
+    @Test
+    void kickAndRepeatedDisconnectCleanUpOnceWithTheClientReason() throws Exception {
+        final AtomicInteger disconnectEvents = new AtomicInteger();
+        process.eventHandler().addListener(PlayerDisconnectEvent.class, _ -> disconnectEvents.incrementAndGet());
+        try (var client = new LoginClient(
+                server.boundAddress(), "Kicked", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+            final PlayerConnection connection = player.getPlayerConnection();
+
+            player.kick(Component.text("Maintenance"));
+
+            assertEquals("Maintenance", client.disconnects.poll(3, TimeUnit.SECONDS));
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+            tick();
+            connection.disconnect();
+            connection.disconnect();
+            assertEquals(1, disconnectEvents.get());
+        }
+    }
+
+    @Test
+    void normalDisconnectUsesAStableClientReason() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "Disconnected", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+
+            player.getPlayerConnection().disconnect();
+
+            assertEquals("Disconnected", client.disconnects.poll(3, TimeUnit.SECONDS));
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+        }
+    }
+
+    @Test
+    void serverShutdownDisconnectsAndCleansAnAdmittedPlayerOnce() throws Exception {
+        final AtomicInteger disconnectEvents = new AtomicInteger();
+        process.eventHandler().addListener(PlayerDisconnectEvent.class, _ -> disconnectEvents.incrementAndGet());
+        try (var client = new LoginClient(
+                server.boundAddress(), "Shutdown", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+            final PlayerConnection connection = player.getPlayerConnection();
+
+            server.stop();
+
+            assertEquals("Server shutting down", client.disconnects.poll(3, TimeUnit.SECONDS));
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+            tick();
+            server.stop();
+            connection.disconnect();
+            assertEquals(1, disconnectEvents.get());
+        }
+    }
+
+    @Test
+    void transferUsesTheNativeBedrockAddressAndPort() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "Transfer", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+
+            player.getPlayerConnection().transfer("target.example", 19133);
+
+            final TransferPacket transfer = client.transfers.poll(3, TimeUnit.SECONDS);
+            assertNotNull(transfer);
+            assertEquals("target.example", transfer.getAddress());
+            assertEquals(19133, transfer.getPort());
+        }
+    }
+
+    @Test
+    void configuredJwtLimitRejectsTheLoginWithAStableReason() throws Exception {
+        restartServer(new BedrockServerLimits(
+                32,
+                20,
+                1400,
+                1_048_576,
+                2_097_152,
+                8_388_608,
+                256,
+                1_024));
+        assertLoginRejected(Credentials.VALID);
+    }
+
+    @Test
+    void configuredPerTickLimitRejectsExcessInboundWork() throws Exception {
+        restartServer(new BedrockServerLimits(
+                32,
+                20,
+                1400,
+                1_048_576,
+                2_097_152,
+                8_388_608,
+                2,
+                1_048_576));
+        try (var client = new LoginClient(
+                server.boundAddress(), "InboundLimit", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            awaitPlayer();
+
+            client.move(new Pos(0, 42, 0), 1);
+            client.move(new Pos(0, 42, 0), 2);
+            client.move(new Pos(0, 42, 0), 3);
+
+            assertEquals(
+                    "Bedrock inbound packet limit exceeded",
+                    client.disconnects.poll(3, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void configuredBatchLimitRejectsExpansionBeforePacketHandling() throws Exception {
+        restartServer(new BedrockServerLimits(
+                32,
+                20,
+                1400,
+                32_768,
+                32_768,
+                32_768,
+                256,
+                1_048_576));
+        try (var client = new LoginClient(
+                server.boundAddress(), "BatchLimit", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            awaitPlayer();
+
+            for (int index = 0; index < 500; index++) {
+                client.sendText("x".repeat(200));
+            }
+
+            assertEquals(
+                    "Bedrock packet exceeds configured limits",
+                    client.disconnects.poll(3, TimeUnit.SECONDS));
+        }
+    }
+
+    private void restartServer(BedrockServerLimits limits) {
+        server.stop();
+        process.stop();
+        process = MinecraftServer.updateProcess();
+        process.dispatcher().start();
+        server = BedrockServer.createForTesting(
+                process,
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                limits);
+        server.start();
+    }
+
     private void assertLoginRejected(Credentials credentials) throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, credentials)) {
@@ -700,6 +878,9 @@ public class BedrockLoginHandshakeTest {
         private final BlockingQueue<RemoveEntityPacket> removedEntities = new LinkedBlockingQueue<>();
         private final BlockingQueue<MobEquipmentPacket> equipment = new LinkedBlockingQueue<>();
         private final BlockingQueue<TextPacket> texts = new LinkedBlockingQueue<>();
+        private final BlockingQueue<NetworkStackLatencyPacket> latencies = new LinkedBlockingQueue<>();
+        private final BlockingQueue<TransferPacket> transfers = new LinkedBlockingQueue<>();
+        private final BlockingQueue<String> disconnects = new LinkedBlockingQueue<>();
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
@@ -1030,7 +1211,23 @@ public class BedrockLoginHandshakeTest {
             }
 
             @Override
+            public PacketSignal handle(NetworkStackLatencyPacket packet) {
+                latencies.add(packet.clone());
+                final NetworkStackLatencyPacket response = packet.clone();
+                response.setFromServer(false);
+                session.sendPacketImmediately(response);
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(TransferPacket packet) {
+                transfers.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
             public PacketSignal handle(DisconnectPacket packet) {
+                disconnects.add(packet.getKickMessage());
                 stage = "disconnected: " + packet.getKickMessage();
                 completed.countDown();
                 return PacketSignal.HANDLED;

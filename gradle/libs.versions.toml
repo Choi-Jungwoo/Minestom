@@ -63,6 +63,8 @@ netty-bom = { group = "io.netty", name = "netty-bom", version.ref = "netty" }
 netty-codec = { group = "io.netty", name = "netty-codec", version.ref = "netty" }
 netty-handler = { group = "io.netty", name = "netty-handler", version.ref = "netty" }
 netty-transport = { group = "io.netty", name = "netty-transport", version.ref = "netty" }
+netty-transport-classes-epoll = { group = "io.netty", name = "netty-transport-classes-epoll", version.ref = "netty" }
+netty-transport-classes-kqueue = { group = "io.netty", name = "netty-transport-classes-kqueue", version.ref = "netty" }
 
 # Performance / Data Structures
 fastutil = { group = "it.unimi.dsi", name = "fastutil", version.ref = "fastutil" }
