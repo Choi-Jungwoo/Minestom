@@ -1,11 +1,28 @@
+import com.diffplug.gradle.spotless.SpotlessExtension
 import net.ltgt.gradle.errorprone.errorprone
 
 plugins {
     alias(libs.plugins.errorprone.plugin)
+    alias(libs.plugins.spotless.plugin)
 }
 
 dependencies {
     errorprone(libs.errorprone.core)
+}
+
+configure<SpotlessExtension> {
+    // The repository predates automated formatting. Ratchet from the shared branch
+    // so this check covers changed files without rewriting unrelated history.
+    ratchetFrom("origin/master")
+    java {
+        trimTrailingWhitespace()
+        leadingTabsToSpaces(4)
+    }
+    kotlinGradle {
+        target("*.gradle.kts")
+        trimTrailingWhitespace()
+        leadingTabsToSpaces(4)
+    }
 }
 
 tasks.withType<JavaCompile>().configureEach {

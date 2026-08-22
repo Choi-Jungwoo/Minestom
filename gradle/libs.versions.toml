@@ -38,6 +38,7 @@ graaltools = "1.1.8"
 jmh-plugin = "0.7.3"
 jcstress-plugin = "0.9.0"
 errorprone-plugin = "5.1.0"
+spotless-plugin = "8.10.0"
 
 [libraries]
 
@@ -103,6 +104,7 @@ blossom = { id = "net.kyori.blossom", version.ref = "blossom" }
 jmh-plugin = { id = "me.champeau.jmh", version.ref = "jmh-plugin" }
 jcstress-plugin = { id = "io.github.reyerizo.gradle.jcstress", version.ref = "jcstress-plugin" }
 errorprone-plugin = { id = "net.ltgt.errorprone", version.ref = "errorprone-plugin" }
+spotless-plugin = { id = "com.diffplug.spotless", version.ref = "spotless-plugin" }
 nmcp = { id = "com.gradleup.nmcp", version.ref = "nmcp" }
 nmcp-aggregation = { id = "com.gradleup.nmcp.aggregation", version.ref = "nmcp" }
 graalvm-native = { id = "org.graalvm.buildtools.native", version.ref = "graaltools" }

@@ -72,7 +72,7 @@ mapping, and protocol pin. The same values are recorded in
 | UDP discovery and protocol selection | Supported | Discovery advertises protocol 1001 |
 | Offline self-signed or guest login | Supported | Not proof of an online Microsoft account |
 | Encryption, compression, empty resource-pack handshake | Supported | Custom resource packs are not supported |
-| StartGame and initial world loading | Supported | Requires the exact verified mapping bundle |
+| StartGame and initial Instance loading | Supported | Requires the exact verified mapping bundle |
 | Chunks, unloads, block updates, basic movement | Supported | Advanced movement capabilities are rejected |
 | Position correction, teleport, Instance change | Supported | Full death/respawn is not supported |
 | Multiple player visibility and basic equipment | Supported | Non-player entities are not supported |
@@ -80,7 +80,7 @@ mapping, and protocol pin. The same values are recorded in
 | Ordinary chat and slash-command execution | Supported | No signed-chat guarantee or command tree/completion |
 | Latency, kick, disconnect, transfer, shutdown | Supported | Stable client reasons hide internal failures |
 | Inventory transactions, containers, interactions | Not supported | No crafting, block use, or entity interaction |
-| Online Xbox/Microsoft authentication | Not supported | Offline identity only |
+| Online Xbox/Microsoft authentication | Not supported | Offline Bedrock identity only |
 
 Passing the automated suite does not claim support for non-player entities,
 command-tree completion, Persona skins, or online account authentication.
@@ -143,7 +143,7 @@ For an update:
 - `mise run check` runs all module tests, formatting/static checks, and the
   tagged real-UDP Bedrock acceptance suite.
 - `mise run bedrock-acceptance` runs discovery, exact codec negotiation, offline
-  login, StartGame/resource packs, world loading, movement/teleport, multiplayer,
+  login, StartGame/resource packs, Instance loading, movement/teleport, multiplayer,
   chat/commands, transfer, disconnect, and the accepted-versus-supported gate.
 - `mise run bedrock-check` runs the complete Bedrock module verification.
 - `mise run bedrock-mappings-verify <directory>` validates release identity,
@@ -203,7 +203,7 @@ class linkage.
 | --- | --- |
 | Server is absent from discovery | UDP firewall/NAT, bind address, advertised port, and listener running state |
 | Startup reports missing or changed mappings | Use the exact revisions above; run `bedrock-mappings-verify` before startup |
-| Experimental client decodes but disconnects in world loading | Its codec is accepted, not supported; do not infer mapping compatibility |
+| Experimental client decodes but disconnects during Instance loading | Its codec is accepted, not supported; do not infer mapping compatibility |
 | Login is rejected | Client name length, JWT expiry/signatures, classic skin bounds, Persona flag, and configured JWT limit |
 | Movement disconnects | Unsupported movement capability or per-tick packet limit |
 | Native transport falls back to NIO | Matching native artifact/classifier is absent or unavailable; NIO remains supported |
