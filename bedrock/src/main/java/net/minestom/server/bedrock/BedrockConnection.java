@@ -56,6 +56,7 @@ import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
 import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
+import org.cloudburstmc.protocol.bedrock.packet.CommandRequestPacket;
 import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
@@ -277,18 +278,26 @@ public final class BedrockConnection extends PlayerConnection {
             session.disconnect("Bedrock chat message is too long");
             return;
         }
-        if (message.startsWith("/")) {
-            player.addPacketToQueue(new ClientCommandChatPacket(message.substring(1)));
-        } else {
-            player.addPacketToQueue(new ClientChatMessagePacket(
-                    message,
-                    System.currentTimeMillis(),
-                    0,
-                    null,
-                    0,
-                    new BitSet(20),
-                    (byte) 0));
+        player.addPacketToQueue(new ClientChatMessagePacket(
+                message,
+                System.currentTimeMillis(),
+                0,
+                null,
+                0,
+                new BitSet(20),
+                (byte) 0));
+    }
+
+    void handle(CommandRequestPacket packet) {
+        final Player player = getPlayer();
+        final String request = packet.getCommand();
+        if (player == null || request == null) return;
+        final String command = request.startsWith("/") ? request.substring(1) : request;
+        if (command.length() > 256) {
+            session.disconnect("Bedrock command is too long");
+            return;
         }
+        player.addPacketToQueue(new ClientCommandChatPacket(command));
     }
 
     void handleDimensionChangeSuccess() {

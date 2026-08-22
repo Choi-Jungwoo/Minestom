@@ -35,6 +35,7 @@ import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockServerInitializer;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
 import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
+import org.cloudburstmc.protocol.bedrock.packet.CommandRequestPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
@@ -541,6 +542,17 @@ public final class BedrockServer {
             final BedrockConnection connection = this.connection;
             if (phase != HandshakePhase.ADMITTED || connection == null) {
                 session.disconnect("Bedrock chat received before player admission");
+                return PacketSignal.HANDLED;
+            }
+            connection.handle(packet);
+            return PacketSignal.HANDLED;
+        }
+
+        @Override
+        public PacketSignal handle(CommandRequestPacket packet) {
+            final BedrockConnection connection = this.connection;
+            if (phase != HandshakePhase.ADMITTED || connection == null) {
+                session.disconnect("Bedrock command received before player admission");
                 return PacketSignal.HANDLED;
             }
             connection.handle(packet);

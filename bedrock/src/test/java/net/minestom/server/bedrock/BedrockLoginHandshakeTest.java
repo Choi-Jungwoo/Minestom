@@ -42,6 +42,8 @@ import org.cloudburstmc.protocol.bedrock.data.PlayerAuthInputData;
 import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.data.auth.AuthType;
 import org.cloudburstmc.protocol.bedrock.data.auth.CertificateChainPayload;
+import org.cloudburstmc.protocol.bedrock.data.command.CommandOriginData;
+import org.cloudburstmc.protocol.bedrock.data.command.CommandOriginType;
 import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.ItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
@@ -53,6 +55,7 @@ import org.cloudburstmc.protocol.bedrock.packet.AddEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
 import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
+import org.cloudburstmc.protocol.bedrock.packet.CommandRequestPacket;
 import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
@@ -544,23 +547,30 @@ public class BedrockLoginHandshakeTest {
             sender.sendMessage(Component.text("command-ok"));
         });
         process.command().register(command);
-        try (var client = new LoginClient(
-                server.boundAddress(), "Chatter", AuthType.SELF_SIGNED, Credentials.VALID)) {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var client = new LoginClient(
+                     server.boundAddress(), "Chatter", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
             client.begin();
             assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
             final Player player = awaitPlayer("Chatter");
             client.texts.clear();
+            observer.texts.clear();
 
             client.sendText("hello");
 
             assertTrue(tickUntil(() -> receivedEvent.get() != null));
             assertSame(player, receivedEvent.get().getPlayer());
             assertEquals("hello", receivedEvent.get().getRawMessage());
-            assertTrue(tickUntil(() -> client.texts.stream()
+            assertTrue(tickUntil(() -> observer.texts.stream()
                     .anyMatch(packet -> packet.getMessage().equals("event:hello"))));
             client.texts.clear();
 
-            client.sendText("/bedrocktest");
+            client.sendCommand("/bedrocktest");
 
             assertTrue(tickUntil(() -> commandPlayer.get() != null));
             assertSame(player, commandPlayer.get());
@@ -837,6 +847,16 @@ public class BedrockLoginHandshakeTest {
             text.setPlatformChatId("");
             text.setFilteredMessage("");
             session.sendPacket(text);
+        }
+
+        private void sendCommand(String command) {
+            final CommandRequestPacket request = new CommandRequestPacket();
+            request.setCommand(command);
+            request.setCommandOriginData(new CommandOriginData(
+                    CommandOriginType.PLAYER, UUID.randomUUID(), "", 0));
+            request.setInternal(false);
+            request.setVersion(48);
+            session.sendPacket(request);
         }
 
         @Override
