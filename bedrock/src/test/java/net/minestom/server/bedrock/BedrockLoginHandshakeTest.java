@@ -9,6 +9,9 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.entity.Player;
+import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
+import net.minestom.server.network.player.GameProfile;
 import org.cloudburstmc.netty.channel.raknet.RakChannelFactory;
 import org.cloudburstmc.netty.channel.raknet.config.RakChannelOption;
 import org.cloudburstmc.protocol.bedrock.BedrockClientSession;
@@ -27,6 +30,7 @@ import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackStackPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
+import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
 import org.jose4j.json.JsonUtil;
@@ -48,6 +52,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockLoginHandshakeTest {
@@ -57,7 +63,8 @@ public class BedrockLoginHandshakeTest {
     @BeforeEach
     void startServer() {
         process = MinecraftServer.updateProcess();
-        server = BedrockServer.create(process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
         server.start();
     }
 
@@ -77,6 +84,14 @@ public class BedrockLoginHandshakeTest {
             assertEquals(PlayStatusPacket.Status.LOGIN_SUCCESS, client.playStatus);
             assertTrue(client.resourcePacksInfoEmpty);
             assertTrue(client.resourcePackStackEmpty);
+            assertTrue(client.startGameReceived, () -> client.stage);
+
+            Player player = awaitPlayer();
+            assertInstanceOf(BedrockConnection.class, player.getPlayerConnection());
+            assertEquals(
+                    UUID.fromString("0c7651f2-577a-3b92-8ff9-3faa54136489"),
+                    player.getUuid());
+            assertSame(server.spawningInstance(), player.getInstance());
         }
     }
 
@@ -88,6 +103,37 @@ public class BedrockLoginHandshakeTest {
 
             assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
             assertEquals(PlayStatusPacket.Status.LOGIN_SUCCESS, client.playStatus);
+        }
+    }
+
+    @Test
+    void preLoginEventReplacesTheFinalGameProfile() throws Exception {
+        UUID replacementUuid = UUID.fromString("11111111-2222-3333-8444-555555555555");
+        process.eventHandler().addListener(AsyncPlayerPreLoginEvent.class, event ->
+                event.setGameProfile(new GameProfile(replacementUuid, "Replacement")));
+        try (var client = new LoginClient(
+                server.boundAddress(), "Original", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            Player player = awaitPlayer();
+            assertEquals(replacementUuid, player.getUuid());
+            assertEquals("Replacement", player.getUsername());
+        }
+    }
+
+    @Test
+    void rejectsASecondLiveConnectionWithTheSameOfflineIdentity() throws Exception {
+        try (var first = new LoginClient(
+                server.boundAddress(), "Duplicate", AuthType.SELF_SIGNED, Credentials.VALID);
+             var second = new LoginClient(
+                     server.boundAddress(), "Duplicate", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            first.begin();
+            assertTrue(first.completed.await(3, TimeUnit.SECONDS), () -> first.stage);
+
+            second.begin();
+            assertTrue(second.completed.await(3, TimeUnit.SECONDS), () -> second.stage);
+            assertEquals("disconnected: Invalid Bedrock login", second.stage);
         }
     }
 
@@ -116,6 +162,17 @@ public class BedrockLoginHandshakeTest {
         }
     }
 
+    private Player awaitPlayer() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (process.connection().getOnlinePlayers().isEmpty()
+                && System.nanoTime() < deadline) {
+            process.connection().updateWaitingPlayers();
+            Thread.sleep(10);
+        }
+        assertEquals(1, process.connection().getOnlinePlayerCount());
+        return process.connection().getOnlinePlayers().iterator().next();
+    }
+
     private enum Credentials {
         VALID,
         EXPIRED_IDENTITY,
@@ -138,6 +195,7 @@ public class BedrockLoginHandshakeTest {
         private volatile PlayStatusPacket.Status playStatus;
         private volatile boolean resourcePacksInfoEmpty;
         private volatile boolean resourcePackStackEmpty;
+        private volatile boolean startGameReceived;
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
@@ -269,6 +327,15 @@ public class BedrockLoginHandshakeTest {
                 var response = new ResourcePackClientResponsePacket();
                 response.setStatus(ResourcePackClientResponsePacket.Status.COMPLETED);
                 session.sendPacket(response);
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(StartGamePacket packet) {
+                stage = "received start game";
+                startGameReceived = packet.getUniqueEntityId() > 0
+                        && packet.getRuntimeEntityId() == packet.getUniqueEntityId()
+                        && packet.getLevelName().equals("Minestom");
                 completed.countDown();
                 return PacketSignal.HANDLED;
             }
@@ -278,6 +345,12 @@ public class BedrockLoginHandshakeTest {
                 stage = "disconnected: " + packet.getKickMessage();
                 completed.countDown();
                 return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public void onDisconnect(CharSequence reason) {
+                stage = "disconnected: " + reason;
+                completed.countDown();
             }
         }
     }

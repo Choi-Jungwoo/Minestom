@@ -59,7 +59,7 @@ final class BedrockLoginValidator {
         if (!gameVersion.startsWith("1.26.")) {
             throw new IllegalArgumentException("Client data is not for Bedrock 1.26");
         }
-        return new VerifiedLogin(clientKey);
+        return new VerifiedLogin(clientKey, name);
     }
 
     private static JsonWebSignature verifiedJwt(String compactJwt) throws Exception {
@@ -136,6 +136,6 @@ final class BedrockLoginValidator {
         return result;
     }
 
-    record VerifiedLogin(PublicKey clientKey) {
+    record VerifiedLogin(PublicKey clientKey, String name) {
     }
 }

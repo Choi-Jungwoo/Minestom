@@ -48,7 +48,8 @@ public class BedrockProtocolNegotiationTest {
     @BeforeEach
     void startServer() {
         process = MinecraftServer.updateProcess();
-        server = BedrockServer.create(process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
         server.start();
     }
 

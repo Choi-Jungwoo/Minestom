@@ -4,11 +4,13 @@ import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.nio.file.Path;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -16,10 +18,14 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockServerLifecycleTest {
+    @TempDir
+    Path mappingsDirectory;
+
     private ServerProcess process;
     private BedrockServer server;
     private boolean processStopped;
@@ -33,9 +39,10 @@ public class BedrockServerLifecycleTest {
     @Test
     void startAndStopAreIdempotentAndReleaseThePort() throws Exception {
         process = MinecraftServer.updateProcess();
-        server = BedrockServer.create(process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
 
-        assertSame(server, BedrockServer.create(process, server.configuredAddress()));
+        assertSame(server, BedrockServer.createForTesting(process, server.configuredAddress()));
         assertFalse(server.isStarted());
 
         assertDoesNotThrow(server::start);
@@ -63,7 +70,8 @@ public class BedrockServerLifecycleTest {
     void processShutdownReleasesThePortAndEventLoopThreads() throws Exception {
         Set<Long> existingThreads = bedrockEventLoopThreads();
         process = MinecraftServer.updateProcess();
-        server = BedrockServer.create(process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
         server.start();
         int port = server.boundAddress().getPort();
         assertTrue(bedrockEventLoopThreads().size() > existingThreads.size());
@@ -81,6 +89,18 @@ public class BedrockServerLifecycleTest {
         try (var socket = new DatagramSocket(port, InetAddress.getLoopbackAddress())) {
             assertTrue(socket.isBound());
         }
+    }
+
+    @Test
+    void invalidOperatorMappingsPreventStartupBeforeBindingUdp() {
+        process = MinecraftServer.updateProcess();
+        var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        var instance = process.instance().createInstanceContainer();
+        server = BedrockServer.create(
+                process, new BedrockServerConfig(address, instance, mappingsDirectory));
+
+        assertThrows(IllegalStateException.class, server::start);
+        assertFalse(server.isStarted());
     }
 
     private static Set<Long> bedrockEventLoopThreads() {

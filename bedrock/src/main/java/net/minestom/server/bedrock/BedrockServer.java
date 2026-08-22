@@ -14,8 +14,13 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Future;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.entity.Player;
 import net.minestom.server.event.GlobalEventHandler;
 import net.minestom.server.event.server.ServerListPingEvent;
+import net.minestom.server.instance.Instance;
+import net.minestom.server.network.ConnectionState;
+import net.minestom.server.network.PlayerAdmission;
+import net.minestom.server.network.player.GameProfile;
 import net.minestom.server.ping.ServerListPingType;
 import net.minestom.server.ping.Status;
 import org.cloudburstmc.netty.channel.raknet.RakChannelFactory;
@@ -48,14 +53,18 @@ import org.jetbrains.annotations.Nullable;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.nio.file.Path;
 import java.security.KeyPair;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
@@ -66,6 +75,7 @@ import java.util.concurrent.TimeUnit;
  * Owns the process-level Bedrock UDP listener.
  */
 public final class BedrockServer {
+    private static final System.Logger LOGGER = System.getLogger(BedrockServer.class.getName());
     private static final long SHUTDOWN_DRAIN_MILLIS = 100;
     private static final int MAX_CONCURRENT_PINGS = 64;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
@@ -79,18 +89,29 @@ public final class BedrockServer {
             2168, Bedrock_v2168.CODEC);
     private static final IdentityHashMap<ServerProcess, BedrockServer> INSTANCES = new IdentityHashMap<>();
 
+    private final ServerProcess process;
     private final GlobalEventHandler eventHandler;
-    private final InetSocketAddress configuredAddress;
+    private final BedrockServerConfig config;
+    private final @Nullable BedrockMappings preloadedMappings;
     private final Set<BedrockServerSession> sessions = ConcurrentHashMap.newKeySet();
+    private final Map<String, IdentityReservation> names = new HashMap<>();
+    private final Map<UUID, IdentityReservation> uuids = new HashMap<>();
+    private final Object identityLock = new Object();
 
     private @Nullable Channel channel;
     private @Nullable EventLoopGroup parentGroup;
     private @Nullable EventLoopGroup childGroup;
     private volatile @Nullable ExecutorService pingExecutor;
+    private volatile @Nullable BedrockMappings mappings;
 
-    private BedrockServer(GlobalEventHandler eventHandler, InetSocketAddress configuredAddress) {
-        this.eventHandler = eventHandler;
-        this.configuredAddress = configuredAddress;
+    private BedrockServer(
+            ServerProcess process,
+            BedrockServerConfig config,
+            @Nullable BedrockMappings preloadedMappings) {
+        this.process = process;
+        this.eventHandler = process.eventHandler();
+        this.config = config;
+        this.preloadedMappings = preloadedMappings;
     }
 
     /**
@@ -106,15 +127,55 @@ public final class BedrockServer {
         if (!(address instanceof InetSocketAddress inetAddress)) {
             throw new IllegalArgumentException("Bedrock requires an internet socket address");
         }
+        final String mappingsDirectory = System.getProperty("minestom.bedrock.mappings");
+        if (mappingsDirectory == null || mappingsDirectory.isBlank()) {
+            throw new IllegalStateException(
+                    "Set minestom.bedrock.mappings to the exact operator-provided mappings directory");
+        }
+        return create(process, new BedrockServerConfig(
+                inetAddress,
+                process.instance().createInstanceContainer(),
+                Path.of(mappingsDirectory)));
+    }
+
+    /**
+     * Returns the single configured Bedrock server owned by a Minestom process.
+     *
+     * @param process the owning process
+     * @param config  immutable listener, instance, and mappings settings
+     * @return the process Bedrock server
+     */
+    public static synchronized BedrockServer create(
+            ServerProcess process, BedrockServerConfig config) {
+        return create(process, config, null);
+    }
+
+    static synchronized BedrockServer createForTesting(
+            ServerProcess process, InetSocketAddress address) {
+        final BedrockServer existing = INSTANCES.get(process);
+        if (existing != null && existing.config.address().equals(address)) return existing;
+        return create(
+                process,
+                new BedrockServerConfig(
+                        address, process.instance().createInstanceContainer(), Path.of(".")),
+                BedrockMappings.testing());
+    }
+
+    private static BedrockServer create(
+            ServerProcess process,
+            BedrockServerConfig config,
+            @Nullable BedrockMappings preloadedMappings) {
+        Objects.requireNonNull(process, "process");
+        Objects.requireNonNull(config, "config");
         final BedrockServer existing = INSTANCES.get(process);
         if (existing != null) {
-            if (!existing.configuredAddress.equals(inetAddress)) {
+            if (!existing.config.equals(config)) {
                 throw new IllegalStateException("A Bedrock server already exists for this process");
             }
             return existing;
         }
 
-        final BedrockServer server = new BedrockServer(process.eventHandler(), inetAddress);
+        final BedrockServer server = new BedrockServer(process, config, preloadedMappings);
         INSTANCES.put(process, server);
         process.scheduler().buildShutdownTask(() -> {
             server.stop();
@@ -131,6 +192,14 @@ public final class BedrockServer {
     public synchronized void start() {
         if (isStarted()) return;
 
+        final BedrockMappings mappings;
+        try {
+            mappings = preloadedMappings != null
+                    ? preloadedMappings
+                    : BedrockMappings.load(config.mappingsDirectory());
+        } catch (Exception exception) {
+            throw new IllegalStateException("Cannot load supported Bedrock mappings", exception);
+        }
         final ExecutorService pingExecutor = createPingExecutor();
         final EventLoopGroup parentGroup =
                 new MultiThreadIoEventLoopGroup(
@@ -145,7 +214,7 @@ public final class BedrockServer {
                     .group(parentGroup, childGroup)
                     .option(RakChannelOption.RAK_HANDLE_PING, true)
                     .childHandler(new Initializer(this))
-                    .bind(configuredAddress)
+                    .bind(config.address())
                     .syncUninterruptibly()
                     .channel();
             try {
@@ -158,11 +227,13 @@ public final class BedrockServer {
             this.parentGroup = parentGroup;
             this.childGroup = childGroup;
             this.channel = channel;
+            this.mappings = mappings;
         } catch (RuntimeException exception) {
             this.pingExecutor = null;
             shutdown(pingExecutor);
             shutdown(parentGroup);
             shutdown(childGroup);
+            this.mappings = null;
             throw exception;
         }
     }
@@ -182,6 +253,7 @@ public final class BedrockServer {
         this.childGroup = null;
         this.parentGroup = null;
         this.pingExecutor = null;
+        this.mappings = null;
 
         @Nullable RuntimeException failure = null;
         if (pingExecutor != null) {
@@ -251,7 +323,11 @@ public final class BedrockServer {
      * @return the configured address
      */
     public InetSocketAddress configuredAddress() {
-        return configuredAddress;
+        return config.address();
+    }
+
+    Instance spawningInstance() {
+        return config.spawningInstance();
     }
 
     /**
@@ -320,6 +396,8 @@ public final class BedrockServer {
         private boolean loginAccepted;
         private boolean encryptionConfirmed;
         private boolean resourcePacksCompleted;
+        private @Nullable IdentityReservation identity;
+        private @Nullable BedrockConnection connection;
 
         private HandshakeHandler(BedrockServer server, BedrockServerSession session) {
             this.server = server;
@@ -361,6 +439,13 @@ public final class BedrockServer {
 
             try {
                 final BedrockLoginValidator.VerifiedLogin verified = BedrockLoginValidator.validate(login);
+                final UUID uuid = BedrockConnection.offlineUuid(verified.name());
+                identity = server.reserveIdentity(verified.name(), uuid);
+                final Channel peerChannel = session.getPeer().getChannel();
+                connection = new BedrockConnection(
+                        session,
+                        (InetSocketAddress) peerChannel.remoteAddress(),
+                        (InetSocketAddress) peerChannel.localAddress());
                 final KeyPair serverKeyPair = EncryptionUtils.createKeyPair();
                 final byte[] token = EncryptionUtils.generateRandomToken();
                 final ServerToClientHandshakePacket handshake = new ServerToClientHandshakePacket();
@@ -414,7 +499,10 @@ public final class BedrockServer {
                     stack.setHasEditorPacks(false);
                     session.sendPacket(stack);
                 }
-                case COMPLETED -> resourcePacksCompleted = true;
+                case COMPLETED -> {
+                    resourcePacksCompleted = true;
+                    admitPlayer();
+                }
                 case SEND_PACKS -> {
                     if (!response.getPackIds().isEmpty()) {
                         session.disconnect("This server has no Bedrock resource packs");
@@ -428,6 +516,97 @@ public final class BedrockServer {
         @Override
         public void onDisconnect(CharSequence reason) {
             server.sessions.remove(session);
+            final BedrockConnection connection = this.connection;
+            if (connection != null) connection.peerDisconnected();
+            server.releaseIdentity(identity);
+        }
+
+        private void admitPlayer() {
+            final IdentityReservation identity = Objects.requireNonNull(this.identity);
+            final BedrockConnection connection = Objects.requireNonNull(this.connection);
+            final GameProfile candidate = new GameProfile(identity.initialUuid, identity.initialName);
+            final PlayerAdmission admission = new PlayerAdmission() {
+                @Override
+                public CompletableFuture<Void> accept(GameProfile gameProfile) {
+                    try {
+                        server.acceptFinalIdentity(identity, gameProfile);
+                        return CompletableFuture.completedFuture(null);
+                    } catch (RuntimeException exception) {
+                        return CompletableFuture.failedFuture(exception);
+                    }
+                }
+
+                @Override
+                public CompletableFuture<Void> prepare(Player player) {
+                    final BedrockMappings mappings = Objects.requireNonNull(
+                            server.mappings, "Bedrock mappings were not loaded");
+                    player.setPendingOptions(server.config.spawningInstance(), false);
+                    connection.setClientState(ConnectionState.PLAY);
+                    connection.setServerState(ConnectionState.PLAY);
+                    connection.sendBedrockPacket(BedrockStartGame.create(
+                            player, server.config.spawningInstance(), mappings));
+                    return CompletableFuture.completedFuture(null);
+                }
+            };
+            var _ = server.process.connection()
+                    .admitPlayer(connection, candidate, admission)
+                    .exceptionally(throwable -> {
+                        LOGGER.log(System.Logger.Level.ERROR, "Bedrock player admission failed", throwable);
+                        server.releaseIdentity(identity);
+                        return null;
+                    });
+        }
+    }
+
+    private IdentityReservation reserveIdentity(String name, UUID uuid) {
+        synchronized (identityLock) {
+            final String normalizedName = name.toLowerCase(Locale.ROOT);
+            if (names.containsKey(normalizedName) || uuids.containsKey(uuid)) {
+                throw new IllegalArgumentException("A Bedrock player with this identity is already connected");
+            }
+            final IdentityReservation reservation = new IdentityReservation(name, uuid);
+            reservation.names.add(normalizedName);
+            reservation.uuids.add(uuid);
+            names.put(normalizedName, reservation);
+            uuids.put(uuid, reservation);
+            return reservation;
+        }
+    }
+
+    private void acceptFinalIdentity(
+            IdentityReservation reservation, GameProfile gameProfile) {
+        synchronized (identityLock) {
+            final String normalizedName = gameProfile.name().toLowerCase(Locale.ROOT);
+            final IdentityReservation nameOwner = names.get(normalizedName);
+            final IdentityReservation uuidOwner = uuids.get(gameProfile.uuid());
+            if ((nameOwner != null && nameOwner != reservation)
+                    || (uuidOwner != null && uuidOwner != reservation)) {
+                throw new IllegalArgumentException("The final Bedrock player identity is already online");
+            }
+            reservation.names.add(normalizedName);
+            reservation.uuids.add(gameProfile.uuid());
+            names.put(normalizedName, reservation);
+            uuids.put(gameProfile.uuid(), reservation);
+        }
+    }
+
+    private void releaseIdentity(@Nullable IdentityReservation reservation) {
+        if (reservation == null) return;
+        synchronized (identityLock) {
+            reservation.names.forEach(name -> names.remove(name, reservation));
+            reservation.uuids.forEach(uuid -> uuids.remove(uuid, reservation));
+        }
+    }
+
+    private static final class IdentityReservation {
+        private final String initialName;
+        private final UUID initialUuid;
+        private final Set<String> names = ConcurrentHashMap.newKeySet();
+        private final Set<UUID> uuids = ConcurrentHashMap.newKeySet();
+
+        private IdentityReservation(String initialName, UUID initialUuid) {
+            this.initialName = initialName;
+            this.initialUuid = initialUuid;
         }
     }
 
