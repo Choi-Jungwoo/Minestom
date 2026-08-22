@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
@@ -26,27 +27,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 final class BedrockMappings {
-    private static final List<String> REQUIRED_FILES = List.of(
-            "LICENSE",
-            "README.md",
-            "additional_offhand_items.json",
-            "biomes.json",
+    private static final List<String> NBT_FILES = List.of(
             "block_shapes.nbt",
             "blocks.nbt",
             "collisions.nbt",
-            "effects.json",
-            "interactions.json",
-            "item_components.nbt",
-            "item_data_components.json",
-            "items.json",
-            "particles.json",
-            "resolvable_item_data_components.json",
-            "sounds.json",
-            "util.json");
-    private static final List<String> JSON_FILES =
-            REQUIRED_FILES.stream().filter(file -> file.endsWith(".json")).toList();
-    private static final List<String> NBT_FILES =
-            REQUIRED_FILES.stream().filter(file -> file.endsWith(".nbt")).toList();
+            "item_components.nbt");
     private static final Map<String, JsonRequirement> JSON_REQUIREMENTS = Map.of(
             "additional_offhand_items.json", new JsonRequirement(JsonRoot.ARRAY, true),
             "biomes.json", new JsonRequirement(JsonRoot.OBJECT, false),
@@ -58,22 +43,26 @@ final class BedrockMappings {
             "resolvable_item_data_components.json", new JsonRequirement(JsonRoot.OBJECT, false),
             "sounds.json", new JsonRequirement(JsonRoot.OBJECT, false),
             "util.json", new JsonRequirement(JsonRoot.OBJECT, false));
+    private static final List<String> REQUIRED_FILES;
+
+    static {
+        final List<String> files = new ArrayList<>(List.of("LICENSE", "README.md"));
+        files.addAll(JSON_REQUIREMENTS.keySet());
+        files.addAll(NBT_FILES);
+        REQUIRED_FILES = List.copyOf(files);
+    }
+
     static final Release SUPPORTED_RELEASE = new Release(
             BedrockCompatibility.JAVA_VERSION,
             BedrockCompatibility.BEDROCK_MAPPING_VERSION,
             BedrockCompatibility.MAPPING_SHA256);
 
     private final Release release;
-    private final Set<String> itemKeys;
-    private final Set<String> biomeKeys;
-    private final int blockStateCount;
+    private final RegistryCoverage coverage;
 
-    private BedrockMappings(
-            Release release, Set<String> itemKeys, Set<String> biomeKeys, int blockStateCount) {
+    private BedrockMappings(Release release, RegistryCoverage coverage) {
         this.release = release;
-        this.itemKeys = Set.copyOf(itemKeys);
-        this.biomeKeys = Set.copyOf(biomeKeys);
-        this.blockStateCount = blockStateCount;
+        this.coverage = coverage;
     }
 
     static BedrockMappings testing(Registries registries) {
@@ -81,9 +70,10 @@ final class BedrockMappings {
                 BedrockCompatibility.JAVA_VERSION,
                 BedrockCompatibility.BEDROCK_MAPPING_VERSION,
                 "0000000000000000000000000000000000000000000000000000000000000000"),
-                registryKeys(registries.material()),
-                registryKeys(registries.biome()),
-                registries.blocks().size());
+                new RegistryCoverage(
+                        registryKeys(registries.material()),
+                        registryKeys(registries.biome()),
+                        registries.blocks().size()));
     }
 
     static BedrockMappings load(Path directory) throws IOException {
@@ -113,8 +103,7 @@ final class BedrockMappings {
         }
         validateReleaseIdentity(root, release);
         final RegistryCoverage coverage = validateRegistryCoverage(root);
-        return new BedrockMappings(
-                release, coverage.itemKeys(), coverage.biomeKeys(), coverage.blockStateCount());
+        return new BedrockMappings(release, coverage);
     }
 
     static String sha256(Path directory, List<String> files) throws IOException {
@@ -148,14 +137,15 @@ final class BedrockMappings {
 
     private static RegistryCoverage validateRegistryCoverage(Path root) throws IOException {
         final Map<String, JsonElement> jsonMappings = new HashMap<>();
-        for (String file : JSON_FILES) {
+        for (Map.Entry<String, JsonRequirement> requirement : JSON_REQUIREMENTS.entrySet()) {
+            final String file = requirement.getKey();
             final JsonElement json;
             try (var reader = Files.newBufferedReader(root.resolve(file))) {
                 json = JsonParser.parseReader(reader);
             } catch (RuntimeException exception) {
                 throw new IllegalArgumentException("Bedrock mapping JSON is invalid: " + file, exception);
             }
-            JSON_REQUIREMENTS.get(file).validate(file, json);
+            requirement.getValue().validate(file, json);
             jsonMappings.put(file, json);
         }
 
@@ -285,21 +275,23 @@ final class BedrockMappings {
     }
 
     int blockStateCount() {
-        return blockStateCount;
+        return coverage.blockStateCount();
     }
 
     int itemCount() {
-        return itemKeys.size();
+        return coverage.itemKeys().size();
     }
 
     int biomeCount() {
-        return biomeKeys.size();
+        return coverage.biomeKeys().size();
     }
 
     void requireRegistryCompatibility(Registries registries) {
-        requireRegistryCoverage("item", itemKeys, registryKeys(registries.material()));
-        requireRegistryCoverage("biome", biomeKeys, registryKeys(registries.biome()));
-        if (blockStateCount < registries.blocks().size()) {
+        requireRegistryCoverage(
+                "item", coverage.itemKeys(), registryKeys(registries.material()));
+        requireRegistryCoverage(
+                "biome", coverage.biomeKeys(), registryKeys(registries.biome()));
+        if (coverage.blockStateCount() < registries.blocks().size()) {
             throw new IllegalArgumentException(
                     "Bedrock block mappings do not cover the Minestom block registry");
         }
@@ -362,5 +354,9 @@ final class BedrockMappings {
 
     private record RegistryCoverage(
             Set<String> itemKeys, Set<String> biomeKeys, int blockStateCount) {
+        private RegistryCoverage {
+            itemKeys = Set.copyOf(itemKeys);
+            biomeKeys = Set.copyOf(biomeKeys);
+        }
     }
 }

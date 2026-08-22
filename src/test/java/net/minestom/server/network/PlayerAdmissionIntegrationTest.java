@@ -109,7 +109,23 @@ public class PlayerAdmissionIntegrationTest {
 
         assertThrows(CompletionException.class, duplicateName::join);
         assertThrows(CompletionException.class, duplicateUuid::join);
-        assertEquals(1, providerCalls.get());
+
+        final GameProfile protectedProfile = profile("Protected");
+        final RecordingConnection protectedConnection = new RecordingConnection();
+        connectionManager.admitPlayer(
+                protectedConnection, protectedProfile, uniqueAdmission).join();
+        final CompletableFuture<Player> javaDuplicateName = connectionManager.admitPlayer(
+                new RecordingConnection(), profile("protected"), javaAdmission);
+        final CompletableFuture<Player> javaDuplicateUuid = connectionManager.admitPlayer(
+                new RecordingConnection(),
+                new GameProfile(protectedProfile.uuid(), "JavaIdentity"), javaAdmission);
+
+        assertThrows(CompletionException.class, javaDuplicateName::join);
+        assertThrows(CompletionException.class, javaDuplicateUuid::join);
+        protectedConnection.disconnect();
+        connectionManager.admitPlayer(
+                new RecordingConnection(), protectedProfile, javaAdmission).join();
+        assertEquals(3, providerCalls.get());
     }
 
     @Test

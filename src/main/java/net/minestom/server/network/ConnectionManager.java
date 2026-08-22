@@ -74,6 +74,8 @@ public final class ConnectionManager {
     // Candidate and final identities reserved by protocols that require uniqueness.
     private final Map<String, AdmissionIdentityReservation> reservedNames = new HashMap<>();
     private final Map<UUID, AdmissionIdentityReservation> reservedUuids = new HashMap<>();
+    // Connections whose online identity must remain unique until removal.
+    private final Set<PlayerConnection> uniqueIdentityConnections = new HashSet<>();
     private volatile boolean acceptingAdmissions = true;
     // Players waiting to be spawned (post configuration state)
     private final MessagePassingQueue<Player> playWaitingPlayers = ConcurrentMessageQueues.mpscUnboundedArrayQueue(64);
@@ -208,7 +210,8 @@ public final class ConnectionManager {
         final AdmissionIdentity identity = AdmissionIdentity.from(gameProfile);
         if (reservation == null) {
             if (reservedNames.containsKey(identity.username())
-                    || reservedUuids.containsKey(identity.uuid())) {
+                    || reservedUuids.containsKey(identity.uuid())
+                    || matchesUniqueOnlinePlayer(identity)) {
                 throw duplicateIdentity();
             }
         } else {
@@ -223,7 +226,16 @@ public final class ConnectionManager {
         final Player player = Objects.requireNonNull(
                 playerProvider.createPlayer(connection, gameProfile), "PlayerProvider returned null");
         this.connectionPlayerMap.put(connection, player);
+        if (reservation != null) uniqueIdentityConnections.add(connection);
         return player;
+    }
+
+    private boolean matchesUniqueOnlinePlayer(AdmissionIdentity identity) {
+        for (PlayerConnection connection : uniqueIdentityConnections) {
+            final Player player = connectionPlayerMap.get(connection);
+            if (player != null && identity.matches(player)) return true;
+        }
+        return false;
     }
 
     /**
@@ -569,6 +581,7 @@ public final class ConnectionManager {
      */
     @ApiStatus.Internal
     public synchronized void removePlayer(PlayerConnection connection) {
+        this.uniqueIdentityConnections.remove(connection);
         final Player player = this.connectionPlayerMap.remove(connection);
         if (player == null) return;
         this.configurationPlayers.remove(player);
@@ -596,6 +609,7 @@ public final class ConnectionManager {
         this.playPlayers.clear();
 
         this.keepAlivePlayers.clear();
+        this.uniqueIdentityConnections.clear();
         this.connectionPlayerMap.clear();
     }
 
