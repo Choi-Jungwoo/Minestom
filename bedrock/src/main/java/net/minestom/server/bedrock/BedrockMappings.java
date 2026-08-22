@@ -207,6 +207,13 @@ final class BedrockMappings {
         return HexFormat.of().formatHex(digest.digest());
     }
 
+    static List<String> releaseFiles() {
+        final List<String> files = new ArrayList<>(REQUIRED_FILES);
+        files.add(RUNTIME_PALETTE_FILE);
+        files.sort(String::compareTo);
+        return List.copyOf(files);
+    }
+
     private static MessageDigest sha256Digest() {
         try {
             return MessageDigest.getInstance("SHA-256");
@@ -331,7 +338,7 @@ final class BedrockMappings {
         final List<NbtMap> runtimeStates;
         try (var input = Files.newInputStream(root.resolve(RUNTIME_PALETTE_FILE));
              var gzip = new GZIPInputStream(input);
-             var reader = NbtUtils.createReaderLE(gzip, true, true)) {
+             var reader = NbtUtils.createReader(gzip, true, true)) {
             final Object rootTag = reader.readTag();
             if (!(rootTag instanceof NbtMap palette)) {
                 throw new IllegalArgumentException(

@@ -92,6 +92,7 @@ import org.jose4j.jwt.JwtClaims;
 import org.jose4j.jwx.HeaderParameterNames;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
@@ -146,6 +147,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void validOfflineLoginCompletesEncryptedEmptyResourcePackHandshake() throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, Credentials.VALID)) {
@@ -234,6 +236,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void loopbackPlayerUsesAuthoritativeInstanceChunksAndMovement() throws Exception {
         var first = server.spawningInstance();
         first.viewDistance(1);
@@ -313,6 +316,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     @SuppressWarnings("deprecation")
     void bedrockPlayersSeeOneAnother() throws Exception {
         try (var observer = new LoginClient(
@@ -545,6 +549,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void bedrockChatAndCommandsUseExistingMinestomSystems() throws Exception {
         final AtomicReference<PlayerChatEvent> receivedEvent = new AtomicReference<>();
         final AtomicReference<Player> commandPlayer = new AtomicReference<>();
@@ -647,6 +652,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void normalDisconnectUsesAStableClientReason() throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "Disconnected", AuthType.SELF_SIGNED, Credentials.VALID)) {
@@ -684,6 +690,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void transferUsesTheNativeBedrockAddressAndPort() throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "Transfer", AuthType.SELF_SIGNED, Credentials.VALID)) {

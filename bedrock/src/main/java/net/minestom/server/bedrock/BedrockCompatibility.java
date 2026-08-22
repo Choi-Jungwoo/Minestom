@@ -13,10 +13,18 @@ public final class BedrockCompatibility {
     public static final int PRIMARY_PROTOCOL = 1001;
     public static final List<Integer> ACCEPTED_PROTOCOLS = BedrockProtocol.acceptedVersions();
     public static final Set<Integer> SUPPORTED_PROTOCOLS = BedrockProtocol.supportedVersions();
+    public static final String MAPPING_SOURCE =
+            "https://github.com/GeyserMC/mappings";
+    public static final String MAPPING_SOURCE_COMMIT =
+            "47949016f0079578a9e979c93a2b3765354235ea";
     public static final String MAPPING_SHA256 =
             "92c1d3bc5b12705d20290363857a19ea202a88bdc5f79f560ead8b345442cbd0";
+    public static final String RUNTIME_PALETTE_SOURCE =
+            "https://github.com/GeyserMC/Geyser";
+    public static final String RUNTIME_PALETTE_SOURCE_COMMIT =
+            "0dbc38fa6ff1d9c4610b5218a3ae1fbacc77c092";
     public static final String RUNTIME_PALETTE_SHA256 =
-            "bedc34ba158f46e4c5c579d2fa4d120fbc7f25ad475cbaff2e9d88fd44fd8ce0";
+            "73ef6dadfa16dd52319493c8112ecb13a020989cf04452f76ff4a8a250a29fea";
     public static final String CLOUDBURST_CONNECTION_VERSION =
             "3.0.0.Beta13-20260814.192942-15";
     public static final String CLOUDBURST_CODEC_VERSION =

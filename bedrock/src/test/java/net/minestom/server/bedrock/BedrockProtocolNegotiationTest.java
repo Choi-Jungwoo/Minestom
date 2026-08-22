@@ -27,6 +27,7 @@ import org.cloudburstmc.protocol.bedrock.packet.RequestNetworkSettingsPacket;
 import org.cloudburstmc.protocol.common.PacketSignal;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -61,6 +62,7 @@ public class BedrockProtocolNegotiationTest {
 
     @ParameterizedTest
     @MethodSource("bedrock126Codecs")
+    @Tag("bedrock-acceptance")
     void selectsTheExactCodecAndNegotiatesCompression(BedrockCodec codec) throws Exception {
         try (var client = new TestClient(server.boundAddress(), codec)) {
             client.requestNetworkSettings(codec.getProtocolVersion());

@@ -25,3 +25,28 @@ run = "gradle :bedrock:check"
 
 [tasks.bedrock-dependencies]
 run = "gradle :bedrock:dependencies --configuration runtimeClasspath"
+
+[tasks.bedrock-acceptance]
+description = "Run the real UDP Bedrock acceptance suite"
+run = "gradle :bedrock:acceptanceTest"
+
+[tasks.bedrock-compatibility]
+description = "Report immutable Bedrock compatibility pins"
+run = "gradle :bedrock:compatibilityReport"
+
+[tasks.bedrock-mappings-verify]
+description = "Verify an operator-provided Bedrock mappings directory"
+usage = 'arg "<directory>" help="Mapping directory to verify"'
+run = 'gradle :bedrock:verifyMappings "-PbedrockMappingsDirectory=${usage_directory?}"'
+
+[tasks.bedrock-mappings-prepare]
+description = "Copy and verify an exact Bedrock mappings directory"
+usage = '''
+arg "<source>" help="Validated source mapping directory"
+arg "<destination>" help="New deployment mapping directory"
+'''
+run = '''
+gradle :bedrock:prepareMappings \
+  "-PbedrockMappingsSource=${usage_source?}" \
+  "-PbedrockMappingsDirectory=${usage_destination?}"
+'''

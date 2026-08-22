@@ -9,6 +9,7 @@ import net.minestom.server.ping.ServerListPingType;
 import net.minestom.server.ping.Status;
 import org.cloudburstmc.protocol.bedrock.BedrockPong;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.net.DatagramPacket;
@@ -38,6 +39,7 @@ public class BedrockDiscoveryTest {
     }
 
     @Test
+    @Tag("bedrock-acceptance")
     void udpDiscoveryUsesStatusAndBedrockPingEvent() throws Exception {
         process = MinecraftServer.updateProcess();
         var eventCalled = new CountDownLatch(1);

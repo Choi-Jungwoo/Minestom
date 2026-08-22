@@ -35,3 +35,58 @@ dependencies {
 
     testImplementation(project(":testing"))
 }
+
+val acceptanceTest = tasks.register<Test>("acceptanceTest") {
+    group = "verification"
+    description = "Runs the real UDP Bedrock compatibility acceptance suite."
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform {
+        includeTags("bedrock-acceptance")
+    }
+    mustRunAfter(tasks.test)
+}
+
+tasks.check {
+    dependsOn(acceptanceTest)
+}
+
+val bedrockMappingsDirectory = providers.gradleProperty("bedrockMappingsDirectory")
+val bedrockMappingsSource = providers.gradleProperty("bedrockMappingsSource")
+
+tasks.register<JavaExec>("verifyMappings") {
+    group = "verification"
+    description = "Verifies an operator-provided Bedrock mapping directory."
+    notCompatibleWithConfigurationCache("The mapping path is supplied at execution time.")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("net.minestom.server.bedrock.BedrockMaintenanceTool")
+    inputs.property("bedrockMappingsDirectory", bedrockMappingsDirectory)
+    argumentProviders.add(CommandLineArgumentProvider {
+        listOf("verify", bedrockMappingsDirectory.get())
+    })
+}
+
+tasks.register<JavaExec>("prepareMappings") {
+    group = "build setup"
+    description = "Copies and re-verifies an exact Bedrock mapping directory."
+    notCompatibleWithConfigurationCache("The mapping paths are supplied at execution time.")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("net.minestom.server.bedrock.BedrockMaintenanceTool")
+    inputs.property("bedrockMappingsSource", bedrockMappingsSource)
+    inputs.property("bedrockMappingsDirectory", bedrockMappingsDirectory)
+    argumentProviders.add(CommandLineArgumentProvider {
+        listOf(
+            "prepare",
+            bedrockMappingsSource.get(),
+            bedrockMappingsDirectory.get(),
+        )
+    })
+}
+
+tasks.register<JavaExec>("compatibilityReport") {
+    group = "help"
+    description = "Reports every immutable Bedrock compatibility pin."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("net.minestom.server.bedrock.BedrockMaintenanceTool")
+    args("report")
+}

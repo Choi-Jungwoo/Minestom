@@ -45,6 +45,23 @@ public class BedrockMappingsTest {
     }
 
     @Test
+    void preparesAValidatedMappingDirectoryWithoutChangingItsIdentity() throws IOException {
+        writeCompleteBundle();
+        var release = releaseForCurrentContents();
+        var destination = directory.resolve("prepared");
+
+        BedrockMaintenanceTool.prepare(directory, destination, release);
+
+        var mappings = BedrockMappings.load(destination, release);
+        assertEquals(release.javaVersion(), mappings.javaVersion());
+        assertEquals(release.bedrockVersion(), mappings.bedrockVersion());
+        assertEquals(release.sha256(), mappings.sha256());
+        assertEquals(1, mappings.blockStateCount());
+        assertEquals(1, mappings.itemCount());
+        assertEquals(1, mappings.biomeCount());
+    }
+
+    @Test
     void rejectsAChangedMappingBundle() throws IOException {
         writeCompleteBundle();
         var release = releaseForCurrentContents();
@@ -149,7 +166,7 @@ public class BedrockMappingsTest {
     private void writeRuntimePalette(NbtMap... states) throws IOException {
         try (var output = Files.newOutputStream(directory.resolve("block_palette.26_30.nbt"));
              var gzip = new GZIPOutputStream(output);
-             var writer = NbtUtils.createWriterLE(gzip)) {
+             var writer = NbtUtils.createWriter(gzip)) {
             writer.writeTag(NbtMap.fromMap(Map.of(
                     "blocks", new NbtList<>(NbtType.COMPOUND, states))));
         }
