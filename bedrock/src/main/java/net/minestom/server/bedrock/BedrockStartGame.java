@@ -2,6 +2,7 @@ package net.minestom.server.bedrock;
 
 import net.minestom.server.entity.Player;
 import net.minestom.server.instance.Instance;
+import net.minestom.server.registry.Registries;
 import net.minestom.server.world.DimensionType;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.cloudburstmc.math.vector.Vector3f;
@@ -23,14 +24,14 @@ final class BedrockStartGame {
     }
 
     static StartGamePacket create(
-            Player player, Instance instance, BedrockMappings mappings, int protocolVersion) {
+            Player player, Instance instance, Registries registries,
+            BedrockMappings mappings, int protocolVersion) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(instance, "instance");
+        Objects.requireNonNull(registries, "registries");
         Objects.requireNonNull(mappings, "mappings");
         mappings.requireAcceptedProtocol(protocolVersion);
-        if (mappings.registryEntryCount() == 0) {
-            throw new IllegalStateException("Bedrock mappings have no validated registry entries");
-        }
+        mappings.requireRegistryCompatibility(registries);
 
         final var position = player.getRespawnPoint();
         final long entityId = player.getEntityId();
@@ -43,7 +44,7 @@ final class BedrockStartGame {
         packet.setSeed(0);
         packet.setSpawnBiomeType(SpawnBiomeType.DEFAULT);
         packet.setCustomBiomeName("");
-        packet.setDimensionId(dimensionId(instance));
+        packet.setDimensionId(dimensionId(instance, registries));
         packet.setGeneratorId(1);
         packet.setLevelGameType(GameType.SURVIVAL);
         packet.setDifficulty(1);
@@ -79,8 +80,10 @@ final class BedrockStartGame {
         return packet;
     }
 
-    private static int dimensionId(Instance instance) {
-        final DimensionType dimensionType = instance.getCachedDimensionType();
+    private static int dimensionId(Instance instance, Registries registries) {
+        final DimensionType dimensionType = Objects.requireNonNull(
+                registries.dimensionType().get(instance.getDimensionType()),
+                "Instance dimension type is not registered");
         if (dimensionType.cardinalLight() == DimensionType.CardinalLight.NETHER) return 1;
         if (dimensionType.skybox() == DimensionType.Skybox.END) return 2;
         return 0;

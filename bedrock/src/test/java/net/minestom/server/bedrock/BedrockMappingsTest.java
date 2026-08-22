@@ -1,6 +1,8 @@
 package net.minestom.server.bedrock;
 
+import org.cloudburstmc.nbt.NbtList;
 import org.cloudburstmc.nbt.NbtMap;
+import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.nbt.NbtUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -28,6 +30,9 @@ public class BedrockMappingsTest {
         assertEquals("26.2", mappings.javaVersion());
         assertEquals("1.26.30.5", mappings.bedrockVersion());
         assertEquals(release.sha256(), mappings.sha256());
+        assertEquals(1, mappings.blockStateCount());
+        assertEquals(1, mappings.itemCount());
+        assertEquals(1, mappings.biomeCount());
     }
 
     @Test
@@ -59,25 +64,46 @@ public class BedrockMappingsTest {
         assertThrows(IOException.class, () -> BedrockMappings.load(directory, release));
     }
 
+    @Test
+    void rejectsAnEmptyRequiredRegistryEvenWhenTheChecksumMatches() throws IOException {
+        writeCompleteBundle();
+        Files.writeString(directory.resolve("effects.json"), "{}");
+        var release = releaseForCurrentContents();
+
+        assertThrows(IllegalArgumentException.class, () -> BedrockMappings.load(directory, release));
+    }
+
+    @Test
+    void rejectsMismatchedBlockRegistryCoverage() throws IOException {
+        writeCompleteBundle();
+        writeNbt("collisions.nbt", NbtMap.fromMap(Map.of(
+                "indices", new int[]{0, 0},
+                "shapes", new NbtList<>(NbtType.INT, 0))));
+        var release = releaseForCurrentContents();
+
+        assertThrows(IllegalArgumentException.class, () -> BedrockMappings.load(directory, release));
+    }
+
     private void writeCompleteBundle() throws IOException {
-        for (String file : List.of(
-                "additional_offhand_items.json",
-                "effects.json",
-                "interactions.json",
-                "item_data_components.json",
-                "particles.json",
-                "resolvable_item_data_components.json",
-                "sounds.json",
-                "util.json")) {
-            Files.writeString(directory.resolve(file), "{}");
+        Files.writeString(directory.resolve("additional_offhand_items.json"), "[]");
+        Files.writeString(directory.resolve("effects.json"), "{\"entry\":{}}");
+        Files.writeString(directory.resolve("interactions.json"), "{\"entry\":[]}");
+        Files.writeString(directory.resolve("item_data_components.json"),
+                "[{\"id\":0,\"key\":\"minecraft:air\",\"components\":{}}]");
+        Files.writeString(directory.resolve("particles.json"), "{\"entry\":{}}");
+        Files.writeString(directory.resolve("resolvable_item_data_components.json"),
+                "{\"value\":[]}");
+        Files.writeString(directory.resolve("sounds.json"), "{\"entry\":{}}");
+        Files.writeString(directory.resolve("util.json"), "{\"entry\":[]}");
+        writeNbt("blocks.nbt", NbtMap.fromMap(Map.of(
+                "bedrock_mappings", new NbtList<>(NbtType.COMPOUND, NbtMap.EMPTY))));
+        for (String file : List.of("block_shapes.nbt", "collisions.nbt")) {
+            writeNbt(file, NbtMap.fromMap(Map.of(
+                    "indices", new int[]{0},
+                    "shapes", new NbtList<>(NbtType.INT, 0))));
         }
-        for (String file : List.of(
-                "block_shapes.nbt", "blocks.nbt", "collisions.nbt", "item_components.nbt")) {
-            try (var output = Files.newOutputStream(directory.resolve(file));
-                 var writer = NbtUtils.createGZIPWriter(output)) {
-                writer.writeTag(NbtMap.fromMap(Map.of("entry", 1)));
-            }
-        }
+        writeNbt("item_components.nbt", NbtMap.fromMap(Map.of(
+                "minecraft:air", NbtMap.EMPTY)));
         Files.writeString(directory.resolve("README.md"), """
                 Generated for Minecraft: Java Edition 26.2 and Minecraft: Bedrock Edition 1.26.30.5.
                 """);
@@ -88,6 +114,13 @@ public class BedrockMappingsTest {
         Files.writeString(directory.resolve("items.json"), """
                 {"minecraft:air":{"bedrock_identifier":"minecraft:air"}}
                 """);
+    }
+
+    private void writeNbt(String file, NbtMap root) throws IOException {
+        try (var output = Files.newOutputStream(directory.resolve(file));
+             var writer = NbtUtils.createGZIPWriter(output)) {
+            writer.writeTag(root);
+        }
     }
 
     private BedrockMappings.Release releaseForCurrentContents() throws IOException {

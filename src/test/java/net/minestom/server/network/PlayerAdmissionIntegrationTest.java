@@ -93,20 +93,42 @@ public class PlayerAdmissionIntegrationTest {
             providerCalls.incrementAndGet();
             return new Player(connection, profile);
         });
-        final PlayerAdmission admission = admission(_ -> {
+        final PlayerAdmission javaAdmission = admission(_ -> {
+        }, _ -> {
+        });
+        final PlayerAdmission uniqueAdmission = uniqueAdmission(_ -> {
         }, _ -> {
         });
 
         connectionManager.admitPlayer(
-                new RecordingConnection(), sharedProfile, admission).join();
+                new RecordingConnection(), sharedProfile, javaAdmission).join();
         final CompletableFuture<Player> duplicateName = connectionManager.admitPlayer(
-                new RecordingConnection(), profile("sharedidentity"), admission);
+                new RecordingConnection(), profile("sharedidentity"), uniqueAdmission);
         final CompletableFuture<Player> duplicateUuid = connectionManager.admitPlayer(
-                new RecordingConnection(), new GameProfile(sharedProfile.uuid(), "OtherIdentity"), admission);
+                new RecordingConnection(), new GameProfile(sharedProfile.uuid(), "OtherIdentity"), uniqueAdmission);
 
         assertThrows(CompletionException.class, duplicateName::join);
         assertThrows(CompletionException.class, duplicateUuid::join);
         assertEquals(1, providerCalls.get());
+    }
+
+    @Test
+    void preservesDuplicateProfilesForAdmissionsWithoutUniqueIdentityPolicy(Env env) {
+        final ConnectionManager connectionManager = env.process().connection();
+        final GameProfile sharedProfile = profile("ExistingJava");
+        final AtomicInteger providerCalls = new AtomicInteger();
+        connectionManager.setPlayerProvider((connection, profile) -> {
+            providerCalls.incrementAndGet();
+            return new Player(connection, profile);
+        });
+        final PlayerAdmission admission = admission(_ -> {
+        }, _ -> {
+        });
+
+        connectionManager.admitPlayer(new RecordingConnection(), sharedProfile, admission).join();
+        connectionManager.admitPlayer(new RecordingConnection(), sharedProfile, admission).join();
+
+        assertEquals(2, providerCalls.get());
     }
 
     @Test
@@ -369,7 +391,23 @@ public class PlayerAdmissionIntegrationTest {
 
     private static PlayerAdmission admission(Consumer<GameProfile> accept,
                                              Consumer<Player> prepare) {
+        return admission(false, accept, prepare);
+    }
+
+    private static PlayerAdmission uniqueAdmission(Consumer<GameProfile> accept,
+                                                   Consumer<Player> prepare) {
+        return admission(true, accept, prepare);
+    }
+
+    private static PlayerAdmission admission(boolean uniqueIdentity,
+                                             Consumer<GameProfile> accept,
+                                             Consumer<Player> prepare) {
         return new PlayerAdmission() {
+            @Override
+            public boolean requiresUniqueIdentity() {
+                return uniqueIdentity;
+            }
+
             @Override
             public CompletableFuture<Void> accept(GameProfile gameProfile) {
                 accept.accept(gameProfile);

@@ -11,8 +11,8 @@ public final class BedrockCompatibility {
     public static final String BEDROCK_MAPPING_VERSION = "1.26.30.5";
     public static final String BEDROCK_WIRE_VERSION = "1.26.30";
     public static final int PRIMARY_PROTOCOL = 1001;
-    public static final List<Integer> ACCEPTED_PROTOCOLS = List.of(924, 944, 975, 1001, 2168);
-    public static final Set<Integer> SUPPORTED_PROTOCOLS = Set.of(PRIMARY_PROTOCOL);
+    public static final List<Integer> ACCEPTED_PROTOCOLS = BedrockProtocol.acceptedVersions();
+    public static final Set<Integer> SUPPORTED_PROTOCOLS = BedrockProtocol.supportedVersions();
     public static final String MAPPING_SHA256 =
             "92c1d3bc5b12705d20290363857a19ea202a88bdc5f79f560ead8b345442cbd0";
     public static final String CLOUDBURST_CONNECTION_VERSION =

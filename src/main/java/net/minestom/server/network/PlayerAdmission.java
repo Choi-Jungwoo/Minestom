@@ -17,6 +17,19 @@ import java.util.concurrent.CompletableFuture;
 public interface PlayerAdmission {
 
     /**
+     * Requests atomic name and UUID uniqueness for this admission.
+     *
+     * <p>The shared admission lifecycle checks both the candidate and final pre-login profile
+     * against online players and other uniqueness-constrained admissions. Protocols that retain
+     * their existing duplicate-login behavior can leave this disabled.
+     *
+     * @return whether this admission requires a unique identity
+     */
+    default boolean requiresUniqueIdentity() {
+        return false;
+    }
+
+    /**
      * Accepts the final profile produced by {@link net.minestom.server.event.player.AsyncPlayerPreLoginEvent}.
      *
      * @param gameProfile the final profile

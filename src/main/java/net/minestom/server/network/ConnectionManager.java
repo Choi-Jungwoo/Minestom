@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -70,8 +71,9 @@ public final class ConnectionManager {
     private final Map<PlayerConnection, Player> connectionPlayerMap = new ConcurrentHashMap<>();
     // Connections currently moving through the protocol-neutral admission lifecycle.
     private final Map<PlayerConnection, AdmissionState> playerAdmissions = new ConcurrentHashMap<>();
-    // Final profiles reserved between pre-login and Player creation.
-    private final Set<AdmissionIdentity> admissionIdentities = new HashSet<>();
+    // Candidate and final identities reserved by protocols that require uniqueness.
+    private final Map<String, AdmissionIdentityReservation> reservedNames = new HashMap<>();
+    private final Map<UUID, AdmissionIdentityReservation> reservedUuids = new HashMap<>();
     private volatile boolean acceptingAdmissions = true;
     // Players waiting to be spawned (post configuration state)
     private final MessagePassingQueue<Player> playWaitingPlayers = ConcurrentMessageQueues.mpscUnboundedArrayQueue(64);
@@ -196,7 +198,28 @@ public final class ConnectionManager {
 
     @ApiStatus.Internal
     public synchronized Player createPlayer(PlayerConnection connection, GameProfile gameProfile) {
+        return createPlayer(connection, gameProfile, null);
+    }
+
+    private synchronized Player createPlayer(
+            PlayerConnection connection, GameProfile gameProfile,
+            @Nullable AdmissionIdentityReservation reservation) {
         assert ServerFlag.INSIDE_TEST || Thread.currentThread().isVirtual();
+        final AdmissionIdentity identity = AdmissionIdentity.from(gameProfile);
+        if (reservation == null) {
+            if (reservedNames.containsKey(identity.username())
+                    || reservedUuids.containsKey(identity.uuid())) {
+                throw duplicateIdentity();
+            }
+        } else {
+            for (Player existing : connectionPlayerMap.values()) {
+                if (identity.matches(existing)) throw duplicateIdentity();
+            }
+            if (reservedNames.get(identity.username()) != reservation
+                    || reservedUuids.get(identity.uuid()) != reservation) {
+                throw duplicateIdentity();
+            }
+        }
         final Player player = Objects.requireNonNull(
                 playerProvider.createPlayer(connection, gameProfile), "PlayerProvider returned null");
         this.connectionPlayerMap.put(connection, player);
@@ -269,51 +292,73 @@ public final class ConnectionManager {
 
     private void runAdmission(AdmissionState state, GameProfile candidateProfile,
                               PlayerAdmission admission, long timeout, TimeUnit unit) {
+        AdmissionIdentityReservation reservation = null;
         try {
             if (state.operation.isDone()) return;
-            final GameProfile finalProfile = finalGameProfile(state.connection, candidateProfile);
-            if (finalProfile == null) {
-                throw new CancellationException("Connection closed during pre-login");
+            if (admission.requiresUniqueIdentity()) {
+                reservation = reserveAdmissionIdentity(candidateProfile);
             }
-
-            final Player player;
-            final AdmissionIdentity identity = reserveAdmissionIdentity(finalProfile);
-            try {
-                awaitAdmissionPhase(state, admission.accept(finalProfile), timeout, unit);
-                ensureAdmissionActive(state);
-                player = createPlayer(state.connection, finalProfile);
-            } finally {
-                releaseAdmissionIdentity(identity);
-            }
-            if (state.operation.isDone()) {
-                rollbackAdmission(state.connection);
-                return;
-            }
-
-            awaitAdmissionPhase(state, admission.prepare(player), timeout, unit);
-            ensureAdmissionActive(state);
-            transitionConfigToPlay(player);
-            state.operation.complete(player);
+            runAdmissionLifecycle(
+                    state, candidateProfile, admission, reservation, timeout, unit);
         } catch (Throwable throwable) {
             if (throwable instanceof InterruptedException) Thread.currentThread().interrupt();
             state.operation.completeExceptionally(throwable);
+        } finally {
+            if (reservation != null) releaseAdmissionIdentity(reservation);
         }
     }
 
-    private synchronized AdmissionIdentity reserveAdmissionIdentity(GameProfile gameProfile) {
+    private void runAdmissionLifecycle(
+            AdmissionState state, GameProfile candidateProfile, PlayerAdmission admission,
+            @Nullable AdmissionIdentityReservation reservation, long timeout, TimeUnit unit)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        final GameProfile finalProfile = finalGameProfile(state.connection, candidateProfile);
+        if (finalProfile == null) {
+            throw new CancellationException("Connection closed during pre-login");
+        }
+        if (reservation != null) reserveAdmissionIdentity(reservation, finalProfile);
+
+        awaitAdmissionPhase(state, admission.accept(finalProfile), timeout, unit);
+        ensureAdmissionActive(state);
+        final Player player = createPlayer(state.connection, finalProfile, reservation);
+        if (state.operation.isDone()) {
+            rollbackAdmission(state.connection);
+            return;
+        }
+
+        awaitAdmissionPhase(state, admission.prepare(player), timeout, unit);
+        ensureAdmissionActive(state);
+        transitionConfigToPlay(player);
+        state.operation.complete(player);
+    }
+
+    private synchronized AdmissionIdentityReservation reserveAdmissionIdentity(GameProfile gameProfile) {
+        final AdmissionIdentityReservation reservation = new AdmissionIdentityReservation();
+        reserveAdmissionIdentity(reservation, gameProfile);
+        return reservation;
+    }
+
+    private synchronized void reserveAdmissionIdentity(
+            AdmissionIdentityReservation reservation, GameProfile gameProfile) {
         final AdmissionIdentity identity = AdmissionIdentity.from(gameProfile);
         for (Player existing : connectionPlayerMap.values()) {
             if (identity.matches(existing)) throw duplicateIdentity();
         }
-        for (AdmissionIdentity reserved : admissionIdentities) {
-            if (identity.conflictsWith(reserved)) throw duplicateIdentity();
+        final AdmissionIdentityReservation nameOwner = reservedNames.get(identity.username());
+        final AdmissionIdentityReservation uuidOwner = reservedUuids.get(identity.uuid());
+        if ((nameOwner != null && nameOwner != reservation)
+                || (uuidOwner != null && uuidOwner != reservation)) {
+            throw duplicateIdentity();
         }
-        admissionIdentities.add(identity);
-        return identity;
+        reservation.names.add(identity.username());
+        reservation.uuids.add(identity.uuid());
+        reservedNames.put(identity.username(), reservation);
+        reservedUuids.put(identity.uuid(), reservation);
     }
 
-    private synchronized void releaseAdmissionIdentity(AdmissionIdentity identity) {
-        admissionIdentities.remove(identity);
+    private synchronized void releaseAdmissionIdentity(AdmissionIdentityReservation reservation) {
+        reservation.names.forEach(name -> reservedNames.remove(name, reservation));
+        reservation.uuids.forEach(uuid -> reservedUuids.remove(uuid, reservation));
     }
 
     private static IllegalArgumentException duplicateIdentity() {
@@ -662,10 +707,11 @@ public final class ConnectionManager {
             return username.equals(player.getUsername().toLowerCase(Locale.ROOT))
                     || uuid.equals(player.getUuid());
         }
+    }
 
-        private boolean conflictsWith(AdmissionIdentity identity) {
-            return username.equals(identity.username) || uuid.equals(identity.uuid);
-        }
+    private static final class AdmissionIdentityReservation {
+        private final Set<String> names = new HashSet<>();
+        private final Set<UUID> uuids = new HashSet<>();
     }
 
 }

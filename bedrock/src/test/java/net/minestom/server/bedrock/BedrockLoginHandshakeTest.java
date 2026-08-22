@@ -133,7 +133,7 @@ public class BedrockLoginHandshakeTest {
 
             second.begin();
             assertTrue(second.completed.await(3, TimeUnit.SECONDS), () -> second.stage);
-            assertEquals("disconnected: Invalid Bedrock login", second.stage);
+            assertEquals("disconnected: §cError during login!", second.stage);
         }
     }
 
@@ -333,9 +333,16 @@ public class BedrockLoginHandshakeTest {
             @Override
             public PacketSignal handle(StartGamePacket packet) {
                 stage = "received start game";
+                final String expectedServerEngine =
+                        "Minestom/" + BedrockCompatibility.JAVA_VERSION
+                                + " BedrockMappings/" + BedrockCompatibility.BEDROCK_MAPPING_VERSION;
                 startGameReceived = packet.getUniqueEntityId() > 0
                         && packet.getRuntimeEntityId() == packet.getUniqueEntityId()
-                        && packet.getLevelName().equals("Minestom");
+                        && packet.getLevelName().equals("Minestom")
+                        && packet.getDimensionId() == 0
+                        && !packet.getLevelId().isBlank()
+                        && packet.getVanillaVersion().equals(BedrockCompatibility.BEDROCK_WIRE_VERSION)
+                        && packet.getServerEngine().equals(expectedServerEngine);
                 completed.countDown();
                 return PacketSignal.HANDLED;
             }

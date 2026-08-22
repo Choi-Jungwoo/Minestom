@@ -30,11 +30,6 @@ import org.cloudburstmc.netty.handler.codec.raknet.server.RakServerOfflineHandle
 import org.cloudburstmc.protocol.bedrock.BedrockPong;
 import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
-import org.cloudburstmc.protocol.bedrock.codec.v1001.Bedrock_v1001;
-import org.cloudburstmc.protocol.bedrock.codec.v2168.Bedrock_v2168;
-import org.cloudburstmc.protocol.bedrock.codec.v924.Bedrock_v924;
-import org.cloudburstmc.protocol.bedrock.codec.v944.Bedrock_v944;
-import org.cloudburstmc.protocol.bedrock.codec.v975.Bedrock_v975;
 import org.cloudburstmc.protocol.bedrock.data.PacketCompressionAlgorithm;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockServerInitializer;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
@@ -56,11 +51,8 @@ import java.net.SocketAddress;
 import java.nio.file.Path;
 import java.security.KeyPair;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -70,7 +62,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
  * Owns the process-level Bedrock UDP listener.
@@ -80,33 +71,15 @@ public final class BedrockServer {
     private static final long SHUTDOWN_DRAIN_MILLIS = 100;
     private static final int MAX_CONCURRENT_PINGS = 64;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
-    private static final String ACCEPTED_PROTOCOLS = BedrockCompatibility.ACCEPTED_PROTOCOLS.stream()
-            .map(String::valueOf)
-            .collect(Collectors.joining(", "));
+    private static final String ACCEPTED_PROTOCOLS = BedrockProtocol.acceptedVersionsDescription();
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacySection();
-    private static final Map<Integer, BedrockCodec> CODECS = Map.of(
-            924, Bedrock_v924.CODEC,
-            944, Bedrock_v944.CODEC,
-            975, Bedrock_v975.CODEC,
-            1001, Bedrock_v1001.CODEC,
-            2168, Bedrock_v2168.CODEC);
     private static final IdentityHashMap<ServerProcess, BedrockServer> INSTANCES = new IdentityHashMap<>();
-
-    static {
-        if (!CODECS.keySet().equals(Set.copyOf(BedrockCompatibility.ACCEPTED_PROTOCOLS))) {
-            throw new ExceptionInInitializerError(
-                    "Bedrock accepted protocols do not match the available codecs");
-        }
-    }
 
     private final ServerProcess process;
     private final GlobalEventHandler eventHandler;
     private final BedrockServerConfig config;
     private final @Nullable BedrockMappings preloadedMappings;
     private final Set<BedrockServerSession> sessions = ConcurrentHashMap.newKeySet();
-    private final Map<String, IdentityReservation> names = new HashMap<>();
-    private final Map<UUID, IdentityReservation> uuids = new HashMap<>();
-    private final Object identityLock = new Object();
 
     private @Nullable Channel channel;
     private @Nullable EventLoopGroup parentGroup;
@@ -168,7 +141,7 @@ public final class BedrockServer {
                 process,
                 new BedrockServerConfig(
                         address, process.instance().createInstanceContainer(), Path.of(".")),
-                BedrockMappings.testing());
+                BedrockMappings.testing(process));
     }
 
     private static BedrockServer create(
@@ -210,6 +183,7 @@ public final class BedrockServer {
         } catch (Exception exception) {
             throw new IllegalStateException("Cannot load supported Bedrock mappings", exception);
         }
+        mappings.requireRegistryCompatibility(process);
         final ExecutorService pingExecutor = createPingExecutor();
         final EventLoopGroup parentGroup =
                 new MultiThreadIoEventLoopGroup(
@@ -394,7 +368,8 @@ public final class BedrockServer {
         @Override
         protected void initSession(BedrockServerSession session) {
             server.sessions.add(session);
-            session.setCodec(Bedrock_v1001.CODEC);
+            session.setCodec(Objects.requireNonNull(
+                    BedrockProtocol.codec(BedrockCompatibility.PRIMARY_PROTOCOL)));
             session.setPacketHandler(new HandshakeHandler(server, session));
         }
     }
@@ -403,7 +378,7 @@ public final class BedrockServer {
         private final BedrockServer server;
         private final BedrockServerSession session;
         private HandshakePhase phase = HandshakePhase.INITIAL;
-        private @Nullable IdentityReservation identity;
+        private @Nullable GameProfile candidateProfile;
         private @Nullable BedrockConnection connection;
 
         private HandshakeHandler(BedrockServer server, BedrockServerSession session) {
@@ -419,7 +394,7 @@ public final class BedrockServer {
             }
 
             final int protocolVersion = request.getProtocolVersion();
-            final BedrockCodec codec = CODECS.get(protocolVersion);
+            final BedrockCodec codec = BedrockProtocol.codec(protocolVersion);
             if (codec == null) {
                 session.disconnect("Unsupported Bedrock protocol " + protocolVersion +
                         "; expected one of " + ACCEPTED_PROTOCOLS);
@@ -447,7 +422,7 @@ public final class BedrockServer {
             try {
                 final BedrockLoginValidator.VerifiedLogin verified = BedrockLoginValidator.validate(login);
                 final UUID uuid = BedrockConnection.offlineUuid(verified.name());
-                identity = server.reserveIdentity(verified.name(), uuid);
+                candidateProfile = new GameProfile(uuid, verified.name());
                 final Channel peerChannel = session.getPeer().getChannel();
                 connection = new BedrockConnection(
                         session,
@@ -535,22 +510,20 @@ public final class BedrockServer {
             server.sessions.remove(session);
             final BedrockConnection connection = this.connection;
             if (connection != null) connection.peerDisconnected();
-            server.releaseIdentity(identity);
         }
 
         private void admitPlayer() {
-            final IdentityReservation identity = Objects.requireNonNull(this.identity);
+            final GameProfile candidate = Objects.requireNonNull(this.candidateProfile);
             final BedrockConnection connection = Objects.requireNonNull(this.connection);
-            final GameProfile candidate = new GameProfile(identity.initialUuid, identity.initialName);
             final PlayerAdmission admission = new PlayerAdmission() {
                 @Override
+                public boolean requiresUniqueIdentity() {
+                    return true;
+                }
+
+                @Override
                 public CompletableFuture<Void> accept(GameProfile gameProfile) {
-                    try {
-                        server.acceptFinalIdentity(identity, gameProfile);
-                        return CompletableFuture.completedFuture(null);
-                    } catch (RuntimeException exception) {
-                        return CompletableFuture.failedFuture(exception);
-                    }
+                    return CompletableFuture.completedFuture(null);
                 }
 
                 @Override
@@ -563,6 +536,7 @@ public final class BedrockServer {
                     connection.sendBedrockPacket(BedrockStartGame.create(
                             player,
                             server.config.spawningInstance(),
+                            server.process,
                             mappings,
                             connection.getProtocolVersion()));
                     return CompletableFuture.completedFuture(null);
@@ -572,7 +546,6 @@ public final class BedrockServer {
                     .admitPlayer(connection, candidate, admission)
                     .exceptionally(throwable -> {
                         LOGGER.log(System.Logger.Level.ERROR, "Bedrock player admission failed", throwable);
-                        server.releaseIdentity(identity);
                         return null;
                     });
         }
@@ -585,58 +558,6 @@ public final class BedrockServer {
         ENCRYPTED,
         PACK_STACK,
         ADMITTED
-    }
-
-    private IdentityReservation reserveIdentity(String name, UUID uuid) {
-        synchronized (identityLock) {
-            final String normalizedName = name.toLowerCase(Locale.ROOT);
-            if (names.containsKey(normalizedName) || uuids.containsKey(uuid)) {
-                throw new IllegalArgumentException("A Bedrock player with this identity is already connected");
-            }
-            final IdentityReservation reservation = new IdentityReservation(name, uuid);
-            reservation.names.add(normalizedName);
-            reservation.uuids.add(uuid);
-            names.put(normalizedName, reservation);
-            uuids.put(uuid, reservation);
-            return reservation;
-        }
-    }
-
-    private void acceptFinalIdentity(
-            IdentityReservation reservation, GameProfile gameProfile) {
-        synchronized (identityLock) {
-            final String normalizedName = gameProfile.name().toLowerCase(Locale.ROOT);
-            final IdentityReservation nameOwner = names.get(normalizedName);
-            final IdentityReservation uuidOwner = uuids.get(gameProfile.uuid());
-            if ((nameOwner != null && nameOwner != reservation)
-                    || (uuidOwner != null && uuidOwner != reservation)) {
-                throw new IllegalArgumentException("The final Bedrock player identity is already online");
-            }
-            reservation.names.add(normalizedName);
-            reservation.uuids.add(gameProfile.uuid());
-            names.put(normalizedName, reservation);
-            uuids.put(gameProfile.uuid(), reservation);
-        }
-    }
-
-    private void releaseIdentity(@Nullable IdentityReservation reservation) {
-        if (reservation == null) return;
-        synchronized (identityLock) {
-            reservation.names.forEach(name -> names.remove(name, reservation));
-            reservation.uuids.forEach(uuid -> uuids.remove(uuid, reservation));
-        }
-    }
-
-    private static final class IdentityReservation {
-        private final String initialName;
-        private final UUID initialUuid;
-        private final Set<String> names = ConcurrentHashMap.newKeySet();
-        private final Set<UUID> uuids = ConcurrentHashMap.newKeySet();
-
-        private IdentityReservation(String initialName, UUID initialUuid) {
-            this.initialName = initialName;
-            this.initialUuid = initialUuid;
-        }
     }
 
     @ChannelHandler.Sharable
