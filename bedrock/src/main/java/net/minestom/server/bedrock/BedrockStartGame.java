@@ -20,6 +20,8 @@ import java.util.Objects;
 import java.util.UUID;
 
 final class BedrockStartGame {
+    static final float PLAYER_EYE_HEIGHT = 1.62f;
+
     private BedrockStartGame() {
     }
 
@@ -39,7 +41,8 @@ final class BedrockStartGame {
         packet.setUniqueEntityId(entityId);
         packet.setRuntimeEntityId(entityId);
         packet.setPlayerGameType(GameType.SURVIVAL);
-        packet.setPlayerPosition(Vector3f.from(position.x(), position.y(), position.z()));
+        packet.setPlayerPosition(Vector3f.from(
+                position.x(), position.y() + PLAYER_EYE_HEIGHT, position.z()));
         packet.setRotation(Vector2f.from(position.yaw(), position.pitch()));
         packet.setSeed(0);
         packet.setSpawnBiomeType(SpawnBiomeType.DEFAULT);
@@ -80,7 +83,7 @@ final class BedrockStartGame {
         return packet;
     }
 
-    private static int dimensionId(Instance instance, Registries registries) {
+    static int dimensionId(Instance instance, Registries registries) {
         final DimensionType dimensionType = Objects.requireNonNull(
                 registries.dimensionType().get(instance.getDimensionType()),
                 "Instance dimension type is not registered");

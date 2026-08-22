@@ -878,7 +878,11 @@ public class Player extends LivingEntity implements CommandSender, HoverEventSou
                 batchSize += 1;
             }
             sendPacket(new ChunkBatchFinishedPacket(batchSize));
-            chunkBatchLead += 1;
+            if (playerConnection.requiresChunkBatchAcknowledgement()) {
+                chunkBatchLead += 1;
+            } else {
+                chunkBatchLead = 0;
+            }
 //            logger.debug("chunk batch sent player={} chunks={} lead={}", username, batchSize, chunkBatchLead);
 
             // After sending the first chunk we always send a synchronize position to the client. This is to prevent

@@ -37,6 +37,7 @@ import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RequestNetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackStackPacket;
@@ -427,7 +428,9 @@ public final class BedrockServer {
                 connection = new BedrockConnection(
                         session,
                         (InetSocketAddress) peerChannel.remoteAddress(),
-                        (InetSocketAddress) peerChannel.localAddress());
+                        (InetSocketAddress) peerChannel.localAddress(),
+                        Objects.requireNonNull(server.mappings, "Bedrock mappings were not loaded"),
+                        server.process);
                 final KeyPair serverKeyPair = EncryptionUtils.createKeyPair();
                 final byte[] token = EncryptionUtils.generateRandomToken();
                 final ServerToClientHandshakePacket handshake = new ServerToClientHandshakePacket();
@@ -506,6 +509,17 @@ public final class BedrockServer {
         }
 
         @Override
+        public PacketSignal handle(PlayerAuthInputPacket packet) {
+            final BedrockConnection connection = this.connection;
+            if (phase != HandshakePhase.ADMITTED || connection == null) {
+                session.disconnect("Bedrock movement received before player admission");
+                return PacketSignal.HANDLED;
+            }
+            connection.handle(packet);
+            return PacketSignal.HANDLED;
+        }
+
+        @Override
         public void onDisconnect(CharSequence reason) {
             server.sessions.remove(session);
             final BedrockConnection connection = this.connection;
@@ -533,6 +547,7 @@ public final class BedrockServer {
                     player.setPendingOptions(server.config.spawningInstance(), false);
                     connection.setClientState(ConnectionState.PLAY);
                     connection.setServerState(ConnectionState.PLAY);
+                    connection.initializeWorld(server.config.spawningInstance());
                     connection.sendBedrockPacket(BedrockStartGame.create(
                             player,
                             server.config.spawningInstance(),

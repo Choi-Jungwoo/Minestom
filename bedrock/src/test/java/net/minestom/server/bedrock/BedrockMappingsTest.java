@@ -4,6 +4,7 @@ import org.cloudburstmc.nbt.NbtList;
 import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.nbt.NbtUtils;
+import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -12,8 +13,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class BedrockMappingsTest {
@@ -33,6 +36,12 @@ public class BedrockMappingsTest {
         assertEquals(1, mappings.blockStateCount());
         assertEquals(1, mappings.itemCount());
         assertEquals(1, mappings.biomeCount());
+        assertEquals(0, mappings.blockDefinition(0).getRuntimeId());
+        assertEquals(
+                "minecraft:air",
+                assertInstanceOf(
+                        SimpleBlockDefinition.class,
+                        mappings.blockDefinition(0)).getIdentifier());
     }
 
     @Test
@@ -84,6 +93,17 @@ public class BedrockMappingsTest {
         assertThrows(IllegalArgumentException.class, () -> BedrockMappings.load(directory, release));
     }
 
+    @Test
+    void rejectsMissingBedrockRuntimeBlockState() throws IOException {
+        writeCompleteBundle();
+        writeRuntimePalette(NbtMap.fromMap(Map.of(
+                "name", "minecraft:stone",
+                "states", NbtMap.EMPTY)));
+        var release = releaseForCurrentContents();
+
+        assertThrows(IllegalArgumentException.class, () -> BedrockMappings.load(directory, release));
+    }
+
     private void writeCompleteBundle() throws IOException {
         Files.writeString(directory.resolve("additional_offhand_items.json"), "[]");
         Files.writeString(directory.resolve("effects.json"), "{\"entry\":{}}");
@@ -97,6 +117,9 @@ public class BedrockMappingsTest {
         Files.writeString(directory.resolve("util.json"), "{\"entry\":[]}");
         writeNbt("blocks.nbt", NbtMap.fromMap(Map.of(
                 "bedrock_mappings", new NbtList<>(NbtType.COMPOUND, NbtMap.EMPTY))));
+        writeRuntimePalette(NbtMap.fromMap(Map.of(
+                "name", "minecraft:air",
+                "states", NbtMap.EMPTY)));
         for (String file : List.of("block_shapes.nbt", "collisions.nbt")) {
             writeNbt(file, NbtMap.fromMap(Map.of(
                     "indices", new int[]{0},
@@ -123,6 +146,15 @@ public class BedrockMappingsTest {
         }
     }
 
+    private void writeRuntimePalette(NbtMap... states) throws IOException {
+        try (var output = Files.newOutputStream(directory.resolve("block_palette.26_30.nbt"));
+             var gzip = new GZIPOutputStream(output);
+             var writer = NbtUtils.createWriterLE(gzip)) {
+            writer.writeTag(NbtMap.fromMap(Map.of(
+                    "blocks", new NbtList<>(NbtType.COMPOUND, states))));
+        }
+    }
+
     private BedrockMappings.Release releaseForCurrentContents() throws IOException {
         return new BedrockMappings.Release(
                 "26.2",
@@ -143,6 +175,7 @@ public class BedrockMappingsTest {
                         "particles.json",
                         "resolvable_item_data_components.json",
                         "sounds.json",
-                        "util.json")));
+                        "util.json")),
+                BedrockMappings.sha256(directory.resolve("block_palette.26_30.nbt")));
     }
 }

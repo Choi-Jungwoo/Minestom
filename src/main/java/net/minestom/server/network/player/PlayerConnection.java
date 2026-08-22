@@ -96,6 +96,18 @@ public abstract class PlayerConnection {
         sendPacket(chunk.getFullDataPacket());
     }
 
+    /**
+     * Returns whether chunk sending must pause until the client acknowledges each batch.
+     *
+     * <p>The Java protocol requires this acknowledgement. Protocol-specific connections
+     * without an equivalent client packet may opt out.
+     *
+     * @return {@code true} when chunk batches require client acknowledgement
+     */
+    public boolean requiresChunkBatchAcknowledgement() {
+        return true;
+    }
+
     public void sendPackets(Collection<SendablePacket> packets) {
         packets.forEach(this::sendPacket);
     }

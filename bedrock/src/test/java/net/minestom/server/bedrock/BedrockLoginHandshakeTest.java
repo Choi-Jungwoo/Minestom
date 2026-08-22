@@ -9,21 +9,38 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.coordinate.Pos;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
+import net.minestom.server.event.player.PlayerMoveEvent;
+import net.minestom.server.instance.block.Block;
 import net.minestom.server.network.player.GameProfile;
+import org.cloudburstmc.math.vector.Vector2f;
+import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.netty.channel.raknet.RakChannelFactory;
 import org.cloudburstmc.netty.channel.raknet.config.RakChannelOption;
+import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.protocol.bedrock.BedrockClientSession;
 import org.cloudburstmc.protocol.bedrock.codec.v1001.Bedrock_v1001;
+import org.cloudburstmc.protocol.bedrock.data.ClientPlayMode;
+import org.cloudburstmc.protocol.bedrock.data.InputInteractionModel;
+import org.cloudburstmc.protocol.bedrock.data.InputMode;
+import org.cloudburstmc.protocol.bedrock.data.PlayerAuthInputData;
 import org.cloudburstmc.protocol.bedrock.data.auth.AuthType;
 import org.cloudburstmc.protocol.bedrock.data.auth.CertificateChainPayload;
+import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockClientInitializer;
+import org.cloudburstmc.protocol.bedrock.netty.codec.packet.BedrockPacketCodec;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
 import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
+import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
+import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
+import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RequestNetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket;
@@ -31,8 +48,10 @@ import org.cloudburstmc.protocol.bedrock.packet.ResourcePackStackPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
+import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
+import org.cloudburstmc.protocol.common.SimpleDefinitionRegistry;
 import org.jose4j.json.JsonUtil;
 import org.jose4j.jws.JsonWebSignature;
 import org.jose4j.jwt.JwtClaims;
@@ -45,14 +64,19 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.security.KeyPair;
 import java.util.Base64;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -63,6 +87,7 @@ public class BedrockLoginHandshakeTest {
     @BeforeEach
     void startServer() {
         process = MinecraftServer.updateProcess();
+        process.dispatcher().start();
         server = BedrockServer.createForTesting(
                 process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
         server.start();
@@ -152,6 +177,74 @@ public class BedrockLoginHandshakeTest {
         assertLoginRejected(Credentials.MISMATCHED_CLIENT_DATA);
     }
 
+    @Test
+    void loopbackPlayerUsesAuthoritativeInstanceWorldAndMovement() throws Exception {
+        var first = server.spawningInstance();
+        first.viewDistance(1);
+        first.loadChunk(0, 0).join();
+        first.setBlock(0, 0, 0, Block.STONE);
+        process.eventHandler().addListener(PlayerMoveEvent.class, event -> {
+            if (event.getNewPosition().x() == 18) event.setCancelled(true);
+        });
+
+        try (var client = new LoginClient(
+                server.boundAddress(), "WorldPlayer", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            Player player = awaitPlayer();
+
+            assertTrue(tickUntil(() -> client.chunks.stream()
+                    .anyMatch(chunk -> chunk.x() == 0 && chunk.z() == 0
+                            && chunk.subChunks() > 0)));
+
+            client.move(new Pos(17, 0, 0), 1);
+            assertTrue(tickUntil(() -> player.getPosition().x() == 17));
+            assertTrue(tickUntil(() -> client.chunks.stream()
+                    .anyMatch(chunk -> chunk.subChunks() == 0)));
+            client.moves.clear();
+
+            first.setBlock(17, 0, 0, Block.DIRT);
+            UpdateBlockPacket update = client.blockUpdates.poll(3, TimeUnit.SECONDS);
+            assertNotNull(update);
+            assertEquals(Block.DIRT.stateId(), update.getDefinition().getRuntimeId());
+
+            client.move(new Pos(18, 0, 0), 2);
+            assertTrue(tickUntil(() -> !client.moves.isEmpty()));
+            MovePlayerPacket correction = awaitMove(client);
+            assertEquals(MovePlayerPacket.Mode.TELEPORT, correction.getMode());
+            assertEquals(17, correction.getPosition().getX());
+            assertEquals(17, player.getPosition().x());
+            client.moves.clear();
+
+            player.teleport(new Pos(20, 0, 0)).join();
+            MovePlayerPacket teleport = awaitMove(client);
+            assertEquals(20, teleport.getPosition().getX());
+            client.move(new Pos(20, 0, 0), 3);
+            tick();
+            assertEquals(20, player.getPosition().x());
+
+            var second = process.instance().createInstanceContainer();
+            second.viewDistance(1);
+            second.loadChunk(0, 0).join();
+            second.setBlock(0, 0, 0, Block.GOLD_BLOCK);
+            client.chunks.clear();
+            client.dimensionChanges.clear();
+            player.setInstance(second, new Pos(0, 0, 0)).join();
+            assertTrue(tickUntil(() -> player.getInstance() == second));
+            assertTrue(
+                    tickUntil(() -> client.dimensionChanges.size() >= 2),
+                    () -> "dimension changes: " + client.dimensionChanges.size());
+            assertTrue(
+                    tickUntil(() -> client.chunks.stream().anyMatch(chunk ->
+                            chunk.x() == 0 && chunk.z() == 0 && chunk.subChunks() > 0)),
+                    () -> "stage: " + client.stage + ", chunks: " + client.chunks);
+
+            client.move(new Pos(0, 0, 0), 4, PlayerAuthInputData.START_FLYING);
+            assertTrue(tickUntil(() -> client.stage.contains(
+                    "Unsupported Bedrock movement capability")));
+        }
+    }
+
     private void assertLoginRejected(Credentials credentials) throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, credentials)) {
@@ -171,6 +264,26 @@ public class BedrockLoginHandshakeTest {
         }
         assertEquals(1, process.connection().getOnlinePlayerCount());
         return process.connection().getOnlinePlayers().iterator().next();
+    }
+
+    private boolean tickUntil(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            tick();
+            Thread.sleep(10);
+        }
+        return condition.getAsBoolean();
+    }
+
+    private void tick() {
+        process.connection().updateWaitingPlayers();
+        process.ticker().tick(System.nanoTime());
+    }
+
+    private static MovePlayerPacket awaitMove(LoginClient client) throws InterruptedException {
+        MovePlayerPacket packet = client.moves.poll(3, TimeUnit.SECONDS);
+        assertTrue(packet != null);
+        return packet;
     }
 
     private enum Credentials {
@@ -196,6 +309,10 @@ public class BedrockLoginHandshakeTest {
         private volatile boolean resourcePacksInfoEmpty;
         private volatile boolean resourcePackStackEmpty;
         private volatile boolean startGameReceived;
+        private final BlockingQueue<ChunkSnapshot> chunks = new LinkedBlockingQueue<>();
+        private final BlockingQueue<UpdateBlockPacket> blockUpdates = new LinkedBlockingQueue<>();
+        private final BlockingQueue<MovePlayerPacket> moves = new LinkedBlockingQueue<>();
+        private final BlockingQueue<ChangeDimensionPacket> dimensionChanges = new LinkedBlockingQueue<>();
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
@@ -235,6 +352,12 @@ public class BedrockLoginHandshakeTest {
                         @Override
                         protected void initSession(BedrockClientSession session) {
                             session.setCodec(Bedrock_v1001.CODEC);
+                            session.getPeer()
+                                    .getChannel()
+                                    .pipeline()
+                                    .get(BedrockPacketCodec.class)
+                                    .getHelper()
+                                    .setBlockDefinitions(blockDefinitions());
                             session.setPacketHandler(new LoginHandler(session, authType));
                             sessionHolder[0] = session;
                             connected.countDown();
@@ -247,10 +370,49 @@ public class BedrockLoginHandshakeTest {
             session = sessionHolder[0];
         }
 
+        private static SimpleDefinitionRegistry<BlockDefinition> blockDefinitions() {
+            final List<BlockDefinition> definitions = new ArrayList<>();
+            for (int stateId = 0; stateId < Block.statesCount(); stateId++) {
+                final Block block = Block.fromStateId(stateId);
+                assert block != null;
+                definitions.add(new SimpleBlockDefinition(
+                        block.key().asString(), stateId, NbtMap.EMPTY));
+            }
+            return SimpleDefinitionRegistry.<BlockDefinition>builder()
+                    .addAll(definitions)
+                    .build();
+        }
+
         private void begin() {
             var request = new RequestNetworkSettingsPacket();
             request.setProtocolVersion(1001);
             session.sendPacketImmediately(request);
+        }
+
+        private void move(Pos position, long tick) {
+            move(position, tick, new PlayerAuthInputData[0]);
+        }
+
+        private void move(
+                Pos position, long tick, PlayerAuthInputData... additionalInputData) {
+            var packet = new PlayerAuthInputPacket();
+            packet.setRotation(Vector3f.from(position.pitch(), position.yaw(), position.yaw()));
+            packet.setPosition(Vector3f.from(
+                    position.x(), position.y() + 1.62, position.z()));
+            packet.setMotion(Vector2f.ZERO);
+            packet.setInputMode(InputMode.MOUSE);
+            packet.setPlayMode(ClientPlayMode.NORMAL);
+            packet.setTick(tick);
+            packet.setDelta(Vector3f.ZERO);
+            packet.setInputInteractionModel(InputInteractionModel.CLASSIC);
+            packet.setInteractRotation(Vector2f.ZERO);
+            packet.setAnalogMoveVector(Vector2f.ZERO);
+            packet.setVehicleRotation(Vector2f.ZERO);
+            packet.setCameraOrientation(Vector3f.ZERO);
+            packet.setRawMoveVector(Vector2f.ZERO);
+            packet.getInputData().add(PlayerAuthInputData.VERTICAL_COLLISION);
+            packet.getInputData().addAll(List.of(additionalInputData));
+            session.sendPacket(packet);
         }
 
         @Override
@@ -348,6 +510,33 @@ public class BedrockLoginHandshakeTest {
             }
 
             @Override
+            public PacketSignal handle(LevelChunkPacket packet) {
+                chunks.add(new ChunkSnapshot(
+                        packet.getChunkX(),
+                        packet.getChunkZ(),
+                        packet.getSubChunksLength()));
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(UpdateBlockPacket packet) {
+                blockUpdates.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(MovePlayerPacket packet) {
+                moves.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(ChangeDimensionPacket packet) {
+                dimensionChanges.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
             public PacketSignal handle(DisconnectPacket packet) {
                 stage = "disconnected: " + packet.getKickMessage();
                 completed.countDown();
@@ -359,7 +548,11 @@ public class BedrockLoginHandshakeTest {
                 stage = "disconnected: " + reason;
                 completed.countDown();
             }
+
         }
+    }
+
+    private record ChunkSnapshot(int x, int z, int subChunks) {
     }
 
     private static String sign(JwtClaims claims, KeyPair keyPair) throws Exception {

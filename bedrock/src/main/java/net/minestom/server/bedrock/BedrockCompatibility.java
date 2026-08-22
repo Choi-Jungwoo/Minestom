@@ -15,6 +15,8 @@ public final class BedrockCompatibility {
     public static final Set<Integer> SUPPORTED_PROTOCOLS = BedrockProtocol.supportedVersions();
     public static final String MAPPING_SHA256 =
             "92c1d3bc5b12705d20290363857a19ea202a88bdc5f79f560ead8b345442cbd0";
+    public static final String RUNTIME_PALETTE_SHA256 =
+            "bedc34ba158f46e4c5c579d2fa4d120fbc7f25ad475cbaff2e9d88fd44fd8ce0";
     public static final String CLOUDBURST_CONNECTION_VERSION =
             "3.0.0.Beta13-20260814.192942-15";
     public static final String CLOUDBURST_CODEC_VERSION =

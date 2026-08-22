@@ -3,11 +3,15 @@ package net.minestom.server.bedrock;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.minestom.server.instance.block.Block;
 import net.minestom.server.registry.Registries;
 import net.minestom.server.registry.Registry;
 import org.cloudburstmc.nbt.NbtList;
 import org.cloudburstmc.nbt.NbtMap;
+import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.nbt.NbtUtils;
+import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -25,8 +29,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
 
 final class BedrockMappings {
+    private static final String RUNTIME_PALETTE_FILE = "block_palette.26_30.nbt";
     private static final List<String> NBT_FILES = List.of(
             "block_shapes.nbt",
             "blocks.nbt",
@@ -55,25 +61,42 @@ final class BedrockMappings {
     static final Release SUPPORTED_RELEASE = new Release(
             BedrockCompatibility.JAVA_VERSION,
             BedrockCompatibility.BEDROCK_MAPPING_VERSION,
-            BedrockCompatibility.MAPPING_SHA256);
+            BedrockCompatibility.MAPPING_SHA256,
+            BedrockCompatibility.RUNTIME_PALETTE_SHA256);
 
     private final Release release;
     private final RegistryCoverage coverage;
+    private final List<BlockDefinition> blockDefinitions;
 
-    private BedrockMappings(Release release, RegistryCoverage coverage) {
+    private BedrockMappings(
+            Release release,
+            RegistryCoverage coverage,
+            List<BlockDefinition> blockDefinitions) {
         this.release = release;
         this.coverage = coverage;
+        this.blockDefinitions = List.copyOf(blockDefinitions);
     }
 
     static BedrockMappings testing(Registries registries) {
+        final List<BlockDefinition> blockDefinitions = new ArrayList<>(Block.statesCount());
+        for (int stateId = 0; stateId < Block.statesCount(); stateId++) {
+            final Block block = Objects.requireNonNull(
+                    Block.fromStateId(stateId), "Missing Minestom block state " + stateId);
+            blockDefinitions.add(new SimpleBlockDefinition(
+                    block.key().asString(), stateId, NbtMap.EMPTY));
+        }
         return new BedrockMappings(new Release(
                 BedrockCompatibility.JAVA_VERSION,
                 BedrockCompatibility.BEDROCK_MAPPING_VERSION,
+                "0000000000000000000000000000000000000000000000000000000000000000",
                 "0000000000000000000000000000000000000000000000000000000000000000"),
                 new RegistryCoverage(
                         registryKeys(registries.material()),
                         registryKeys(registries.biome()),
-                        registries.blocks().size()));
+                        Block.statesCount(),
+                        List.of(),
+                        Map.of("minecraft:plains", 1)),
+                blockDefinitions);
     }
 
     static BedrockMappings load(Path directory) throws IOException {
@@ -94,6 +117,14 @@ final class BedrockMappings {
                 throw new IllegalArgumentException("Bedrock mappings are missing " + file);
             }
         }
+        final Path runtimePalette = root.resolve(RUNTIME_PALETTE_FILE);
+        if (!runtimePalette.normalize().startsWith(root)
+                || !Files.isRegularFile(runtimePalette)
+                || Files.isSymbolicLink(runtimePalette)
+                || Files.size(runtimePalette) == 0) {
+            throw new IllegalArgumentException(
+                    "Bedrock mappings are missing " + RUNTIME_PALETTE_FILE);
+        }
 
         final String actualChecksum = sha256(root, REQUIRED_FILES);
         if (!release.sha256().equals(actualChecksum)) {
@@ -101,30 +132,52 @@ final class BedrockMappings {
                     "Bedrock mapping checksum mismatch: expected " + release.sha256()
                             + ", got " + actualChecksum);
         }
+        final String actualRuntimePaletteChecksum = sha256(runtimePalette);
+        if (!release.runtimePaletteSha256().equals(actualRuntimePaletteChecksum)) {
+            throw new IllegalArgumentException(
+                    "Bedrock runtime palette checksum mismatch: expected "
+                            + release.runtimePaletteSha256()
+                            + ", got " + actualRuntimePaletteChecksum);
+        }
         validateReleaseIdentity(root, release);
         final RegistryCoverage coverage = validateRegistryCoverage(root);
-        return new BedrockMappings(release, coverage);
+        final List<BlockDefinition> blockDefinitions =
+                loadBlockDefinitions(root, coverage.blockMappings());
+        return new BedrockMappings(release, coverage, blockDefinitions);
     }
 
     static String sha256(Path directory, List<String> files) throws IOException {
-        final MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException exception) {
-            throw new AssertionError(exception);
-        }
+        final MessageDigest digest = sha256Digest();
         for (String file : files.stream().sorted().toList()) {
             digest.update(file.getBytes(StandardCharsets.UTF_8));
             digest.update((byte) 0);
-            try (InputStream input = Files.newInputStream(directory.resolve(file))) {
-                final byte[] buffer = new byte[8192];
-                int length;
-                while ((length = input.read(buffer)) >= 0) {
-                    digest.update(buffer, 0, length);
-                }
-            }
+            updateDigest(digest, directory.resolve(file));
         }
         return HexFormat.of().formatHex(digest.digest());
+    }
+
+    static String sha256(Path file) throws IOException {
+        final MessageDigest digest = sha256Digest();
+        updateDigest(digest, file);
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static MessageDigest sha256Digest() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException exception) {
+            throw new AssertionError(exception);
+        }
+    }
+
+    private static void updateDigest(MessageDigest digest, Path file) throws IOException {
+        try (InputStream input = Files.newInputStream(file)) {
+            final byte[] buffer = new byte[8192];
+            int length;
+            while ((length = input.read(buffer)) >= 0) {
+                digest.update(buffer, 0, length);
+            }
+        }
     }
 
     private static void validateReleaseIdentity(Path root, Release release) throws IOException {
@@ -151,12 +204,16 @@ final class BedrockMappings {
 
         final JsonObject biomes = jsonMappings.get("biomes.json").getAsJsonObject();
         final Set<String> biomeKeys = new HashSet<>();
+        final Map<String, Integer> biomeIds = new HashMap<>();
         for (Map.Entry<String, JsonElement> entry : biomes.entrySet()) {
             if (!entry.getValue().isJsonObject()
                     || !isNumber(entry.getValue().getAsJsonObject().get("bedrock_id"))) {
                 throw invalidRegistryEntry("biomes.json", entry.getKey());
             }
             biomeKeys.add(entry.getKey());
+            biomeIds.put(
+                    entry.getKey(),
+                    entry.getValue().getAsJsonObject().get("bedrock_id").getAsInt());
         }
         if (!biomeKeys.contains("minecraft:plains")) {
             throw new IllegalArgumentException("Bedrock mappings are missing the plains biome");
@@ -209,8 +266,9 @@ final class BedrockMappings {
             nbtMappings.put(file, nbt);
         }
 
-        final int blockStateCount = requireNbtList(
-                nbtMappings.get("blocks.nbt"), "bedrock_mappings", "blocks.nbt").size();
+        final List<NbtMap> blockMappings = requireCompoundList(
+                nbtMappings.get("blocks.nbt"), "bedrock_mappings", "blocks.nbt");
+        final int blockStateCount = blockMappings.size();
         validateShapeRegistry(nbtMappings.get("block_shapes.nbt"), "block_shapes.nbt", blockStateCount);
         validateShapeRegistry(nbtMappings.get("collisions.nbt"), "collisions.nbt", blockStateCount);
         final NbtMap itemComponents = nbtMappings.get("item_components.nbt");
@@ -219,7 +277,68 @@ final class BedrockMappings {
             throw new IllegalArgumentException(
                     "Bedrock item_components.nbt does not cover structured item components");
         }
-        return new RegistryCoverage(itemKeys, biomeKeys, blockStateCount);
+        return new RegistryCoverage(
+                itemKeys, biomeKeys, blockStateCount, blockMappings, biomeIds);
+    }
+
+    private static List<BlockDefinition> loadBlockDefinitions(
+            Path root, List<NbtMap> javaMappings) throws IOException {
+        final List<NbtMap> runtimeStates;
+        try (var input = Files.newInputStream(root.resolve(RUNTIME_PALETTE_FILE));
+             var gzip = new GZIPInputStream(input);
+             var reader = NbtUtils.createReaderLE(gzip, true, true)) {
+            final Object rootTag = reader.readTag();
+            if (!(rootTag instanceof NbtMap palette)) {
+                throw new IllegalArgumentException(
+                        "Bedrock runtime palette has an invalid root");
+            }
+            runtimeStates = palette.getList("blocks", NbtType.COMPOUND);
+        }
+        if (runtimeStates.isEmpty()) {
+            throw new IllegalArgumentException("Bedrock runtime palette is empty");
+        }
+
+        final Map<NbtMap, Integer> runtimeIds = new HashMap<>(runtimeStates.size());
+        for (int runtimeId = 0; runtimeId < runtimeStates.size(); runtimeId++) {
+            final NbtMap state = normalizeRuntimeState(runtimeStates.get(runtimeId));
+            if (runtimeIds.put(state, runtimeId) != null) {
+                throw new IllegalArgumentException(
+                        "Bedrock runtime palette contains duplicate block states");
+            }
+        }
+
+        final List<BlockDefinition> definitions = new ArrayList<>(javaMappings.size());
+        for (int stateId = 0; stateId < javaMappings.size(); stateId++) {
+            final Block block = Block.fromStateId(stateId);
+            if (block == null) {
+                throw new IllegalArgumentException(
+                        "Bedrock mappings contain an unknown Minestom block state " + stateId);
+            }
+            final NbtMap mapping = javaMappings.get(stateId);
+            String identifier = mapping.getString(
+                    "bedrock_identifier", block.key().asString());
+            if (identifier.indexOf(':') < 0) identifier = "minecraft:" + identifier;
+            final NbtMap state = NbtMap.builder()
+                    .putString("name", identifier)
+                    .putCompound("states", mapping.getCompound("state"))
+                    .build();
+            final Integer runtimeId = runtimeIds.get(state);
+            if (runtimeId == null) {
+                throw new IllegalArgumentException(
+                        "Bedrock runtime palette has no mapping for Minestom block state "
+                                + stateId + ": " + state);
+            }
+            definitions.add(new SimpleBlockDefinition(
+                    identifier, runtimeId, state.getCompound("states")));
+        }
+        return definitions;
+    }
+
+    private static NbtMap normalizeRuntimeState(NbtMap state) {
+        return NbtMap.builder()
+                .putString("name", state.getString("name"))
+                .putCompound("states", state.getCompound("states"))
+                .build();
     }
 
     private static void validateShapeRegistry(
@@ -239,6 +358,16 @@ final class BedrockMappings {
                     "Bedrock mapping " + file + " is missing non-empty " + key);
         }
         return list;
+    }
+
+    private static List<NbtMap> requireCompoundList(
+            NbtMap root, String key, String file) {
+        final List<NbtMap> list = root.getList(key, NbtType.COMPOUND);
+        if (list.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Bedrock mapping " + file + " is missing non-empty " + key);
+        }
+        return List.copyOf(list);
     }
 
     private static boolean isNumber(JsonElement element) {
@@ -278,6 +407,34 @@ final class BedrockMappings {
         return coverage.blockStateCount();
     }
 
+    BlockDefinition blockDefinition(int javaStateId) {
+        if (javaStateId < 0 || javaStateId >= blockDefinitions.size()) {
+            throw new IllegalArgumentException(
+                    "No Bedrock mapping for Minestom block state " + javaStateId);
+        }
+        return blockDefinitions.get(javaStateId);
+    }
+
+    int biomeId(int javaBiomeId, Registry<?> biomeRegistry) {
+        final var key = biomeRegistry.getKey(javaBiomeId);
+        if (key == null) {
+            throw new IllegalArgumentException(
+                    "Unknown Minestom biome id " + javaBiomeId);
+        }
+        final Integer bedrockId = coverage.biomeIds().get(key.key().asString());
+        if (bedrockId == null) {
+            throw new IllegalArgumentException(
+                    "No Bedrock mapping for Minestom biome " + key.key().asString());
+        }
+        return bedrockId;
+    }
+
+    int defaultBiomeId() {
+        return Objects.requireNonNull(
+                coverage.biomeIds().get("minecraft:plains"),
+                "Bedrock mappings are missing the plains biome");
+    }
+
     int itemCount() {
         return coverage.itemKeys().size();
     }
@@ -291,7 +448,7 @@ final class BedrockMappings {
                 "item", coverage.itemKeys(), registryKeys(registries.material()));
         requireRegistryCoverage(
                 "biome", coverage.biomeKeys(), registryKeys(registries.biome()));
-        if (coverage.blockStateCount() < registries.blocks().size()) {
+        if (coverage.blockStateCount() < Block.statesCount()) {
             throw new IllegalArgumentException(
                     "Bedrock block mappings do not cover the Minestom block registry");
         }
@@ -319,13 +476,22 @@ final class BedrockMappings {
         }
     }
 
-    record Release(String javaVersion, String bedrockVersion, String sha256) {
+    record Release(
+            String javaVersion,
+            String bedrockVersion,
+            String sha256,
+            String runtimePaletteSha256) {
         Release {
             Objects.requireNonNull(javaVersion, "javaVersion");
             Objects.requireNonNull(bedrockVersion, "bedrockVersion");
             Objects.requireNonNull(sha256, "sha256");
+            Objects.requireNonNull(runtimePaletteSha256, "runtimePaletteSha256");
             if (!sha256.matches("[0-9a-f]{64}")) {
                 throw new IllegalArgumentException("sha256 must be 64 lowercase hexadecimal characters");
+            }
+            if (!runtimePaletteSha256.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException(
+                        "runtimePaletteSha256 must be 64 lowercase hexadecimal characters");
             }
         }
     }
@@ -353,10 +519,16 @@ final class BedrockMappings {
     }
 
     private record RegistryCoverage(
-            Set<String> itemKeys, Set<String> biomeKeys, int blockStateCount) {
+            Set<String> itemKeys,
+            Set<String> biomeKeys,
+            int blockStateCount,
+            List<NbtMap> blockMappings,
+            Map<String, Integer> biomeIds) {
         private RegistryCoverage {
             itemKeys = Set.copyOf(itemKeys);
             biomeKeys = Set.copyOf(biomeKeys);
+            blockMappings = List.copyOf(blockMappings);
+            biomeIds = Map.copyOf(biomeIds);
         }
     }
 }
