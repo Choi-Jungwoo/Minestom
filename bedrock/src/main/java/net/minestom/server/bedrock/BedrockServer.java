@@ -45,6 +45,7 @@ import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackStackPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
+import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
 import org.jetbrains.annotations.Nullable;
@@ -532,6 +533,17 @@ public final class BedrockServer {
             if (packet.getAction() == PlayerActionType.DIMENSION_CHANGE_SUCCESS) {
                 connection.handleDimensionChangeSuccess();
             }
+            return PacketSignal.HANDLED;
+        }
+
+        @Override
+        public PacketSignal handle(TextPacket packet) {
+            final BedrockConnection connection = this.connection;
+            if (phase != HandshakePhase.ADMITTED || connection == null) {
+                session.disconnect("Bedrock chat received before player admission");
+                return PacketSignal.HANDLED;
+            }
+            connection.handle(packet);
             return PacketSignal.HANDLED;
         }
 

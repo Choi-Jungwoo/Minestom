@@ -10,6 +10,7 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import net.kyori.adventure.text.Component;
 import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.command.builder.Command;
 import net.minestom.server.component.DataComponents;
 import net.minestom.server.coordinate.Pos;
 import net.minestom.server.entity.Entity;
@@ -17,6 +18,7 @@ import net.minestom.server.entity.EntityType;
 import net.minestom.server.entity.EquipmentSlot;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
+import net.minestom.server.event.player.PlayerChatEvent;
 import net.minestom.server.event.player.PlayerMoveEvent;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.item.ItemStack;
@@ -70,6 +72,7 @@ import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
+import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
@@ -97,6 +100,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -526,6 +530,45 @@ public class BedrockLoginHandshakeTest {
         }
     }
 
+    @Test
+    void bedrockChatAndCommandsUseExistingMinestomSystems() throws Exception {
+        final AtomicReference<PlayerChatEvent> receivedEvent = new AtomicReference<>();
+        final AtomicReference<Player> commandPlayer = new AtomicReference<>();
+        process.eventHandler().addListener(PlayerChatEvent.class, event -> {
+            receivedEvent.set(event);
+            event.setFormattedMessage(Component.text("event:" + event.getRawMessage()));
+        });
+        final Command command = new Command("bedrocktest");
+        command.setDefaultExecutor((sender, _) -> {
+            commandPlayer.set((Player) sender);
+            sender.sendMessage(Component.text("command-ok"));
+        });
+        process.command().register(command);
+        try (var client = new LoginClient(
+                server.boundAddress(), "Chatter", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer("Chatter");
+            client.texts.clear();
+
+            client.sendText("hello");
+
+            assertTrue(tickUntil(() -> receivedEvent.get() != null));
+            assertSame(player, receivedEvent.get().getPlayer());
+            assertEquals("hello", receivedEvent.get().getRawMessage());
+            assertTrue(tickUntil(() -> client.texts.stream()
+                    .anyMatch(packet -> packet.getMessage().equals("event:hello"))));
+            client.texts.clear();
+
+            client.sendText("/bedrocktest");
+
+            assertTrue(tickUntil(() -> commandPlayer.get() != null));
+            assertSame(player, commandPlayer.get());
+            assertTrue(tickUntil(() -> client.texts.stream()
+                    .anyMatch(packet -> packet.getMessage().equals("command-ok"))));
+        }
+    }
+
     private void assertLoginRejected(Credentials credentials) throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, credentials)) {
@@ -627,6 +670,7 @@ public class BedrockLoginHandshakeTest {
         private final KeyPair identityKey = EncryptionUtils.createKeyPair();
         private final String identityJwt;
         private final String clientJwt;
+        private final String name;
 
         private final BedrockClientSession session;
         private final Channel channel;
@@ -645,10 +689,12 @@ public class BedrockLoginHandshakeTest {
         private final BlockingQueue<SetEntityDataPacket> entityData = new LinkedBlockingQueue<>();
         private final BlockingQueue<RemoveEntityPacket> removedEntities = new LinkedBlockingQueue<>();
         private final BlockingQueue<MobEquipmentPacket> equipment = new LinkedBlockingQueue<>();
+        private final BlockingQueue<TextPacket> texts = new LinkedBlockingQueue<>();
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
                 throws Exception {
+            this.name = name;
             String publicKey = Base64.getEncoder().encodeToString(identityKey.getPublic().getEncoded());
             JwtClaims identityClaims = new JwtClaims();
             identityClaims.setIssuedAtToNow();
@@ -779,6 +825,18 @@ public class BedrockLoginHandshakeTest {
             packet.getInputData().add(PlayerAuthInputData.VERTICAL_COLLISION);
             packet.getInputData().addAll(List.of(additionalInputData));
             session.sendPacket(packet);
+        }
+
+        private void sendText(String message) {
+            final TextPacket text = new TextPacket();
+            text.setType(TextPacket.Type.CHAT);
+            text.setSourceName(name);
+            text.setMessage(message);
+            text.setNeedsTranslation(false);
+            text.setXuid("");
+            text.setPlatformChatId("");
+            text.setFilteredMessage("");
+            session.sendPacket(text);
         }
 
         @Override
@@ -942,6 +1000,12 @@ public class BedrockLoginHandshakeTest {
             @Override
             public PacketSignal handle(MobEquipmentPacket packet) {
                 equipment.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(TextPacket packet) {
+                texts.add(packet.clone());
                 return PacketSignal.HANDLED;
             }
 

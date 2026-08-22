@@ -14,6 +14,8 @@ import net.minestom.server.instance.Chunk;
 import net.minestom.server.instance.Instance;
 import net.minestom.server.item.ItemStack;
 import net.minestom.server.network.ConnectionState;
+import net.minestom.server.network.packet.client.play.ClientChatMessagePacket;
+import net.minestom.server.network.packet.client.play.ClientCommandChatPacket;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
 import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
 import net.minestom.server.network.packet.server.CachedPacket;
@@ -29,6 +31,7 @@ import net.minestom.server.network.packet.server.play.PlayerInfoRemovePacket;
 import net.minestom.server.network.packet.server.play.PlayerInfoUpdatePacket;
 import net.minestom.server.network.packet.server.play.PlayerPositionAndLookPacket;
 import net.minestom.server.network.packet.server.play.SpawnEntityPacket;
+import net.minestom.server.network.packet.server.play.SystemChatPacket;
 import net.minestom.server.network.packet.server.play.UnloadChunkPacket;
 import net.minestom.server.network.packet.server.play.UpdateViewPositionPacket;
 import net.minestom.server.network.player.PlayerConnection;
@@ -65,6 +68,7 @@ import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerListPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
+import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.jetbrains.annotations.Nullable;
 
@@ -72,6 +76,7 @@ import java.awt.Color;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.Map;
 import java.util.Objects;
@@ -167,6 +172,8 @@ public final class BedrockConnection extends PlayerConnection {
                 sendChunkPublisherUpdate(view);
             } else if (packet instanceof PlayerPositionAndLookPacket position) {
                 sendPosition(position);
+            } else if (packet instanceof SystemChatPacket chat) {
+                sendSystemChat(chat);
             } else if (packet instanceof PlayerInfoUpdatePacket playerInfo) {
                 sendPlayerInfo(playerInfo);
             } else if (packet instanceof PlayerInfoRemovePacket playerInfo) {
@@ -259,6 +266,29 @@ public final class BedrockConnection extends PlayerConnection {
                 feetPosition,
                 packet.getInputData().contains(PlayerAuthInputData.VERTICAL_COLLISION),
                 packet.getInputData().contains(PlayerAuthInputData.HORIZONTAL_COLLISION)));
+    }
+
+    void handle(TextPacket packet) {
+        if (packet.getType() != TextPacket.Type.CHAT) return;
+        final Player player = getPlayer();
+        final String message = packet.getMessage();
+        if (player == null || message == null) return;
+        if (message.length() > 256) {
+            session.disconnect("Bedrock chat message is too long");
+            return;
+        }
+        if (message.startsWith("/")) {
+            player.addPacketToQueue(new ClientCommandChatPacket(message.substring(1)));
+        } else {
+            player.addPacketToQueue(new ClientChatMessagePacket(
+                    message,
+                    System.currentTimeMillis(),
+                    0,
+                    null,
+                    0,
+                    new BitSet(20),
+                    (byte) 0));
+        }
     }
 
     void handleDimensionChangeSuccess() {
@@ -416,6 +446,18 @@ public final class BedrockConnection extends PlayerConnection {
             list.getEntries().add(entry);
         }
         if (!list.getEntries().isEmpty()) sendBedrockPacket(list);
+    }
+
+    private void sendSystemChat(SystemChatPacket packet) {
+        final TextPacket text = new TextPacket();
+        text.setType(packet.overlay() ? TextPacket.Type.TIP : TextPacket.Type.SYSTEM);
+        text.setSourceName("");
+        text.setMessage(LEGACY.serialize(packet.message()));
+        text.setNeedsTranslation(false);
+        text.setXuid("");
+        text.setPlatformChatId("");
+        text.setFilteredMessage("");
+        sendBedrockPacket(text);
     }
 
     @SuppressWarnings("deprecation")
