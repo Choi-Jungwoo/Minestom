@@ -3,6 +3,9 @@ package net.minestom.server.bedrock;
 import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
 import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
@@ -12,9 +15,14 @@ import java.util.UUID;
 final class BedrockSkin {
     private static final int WIDTH = 64;
     private static final int MAX_HEIGHT = 64;
+    private static final int CAPE_WIDTH = 64;
+    private static final int CAPE_HEIGHT = 32;
+    private static final int CAPE_PIXEL_BYTES = CAPE_WIDTH * CAPE_HEIGHT * 4;
     private static final int MAX_PIXEL_BYTES = WIDTH * MAX_HEIGHT * 4;
     private static final int MAX_ENCODED_PIXEL_BYTES = ((MAX_PIXEL_BYTES + 2) / 3) * 4;
     private static final int MAX_SKIN_ID_LENGTH = 128;
+    private static final String CLASSIC_RESOURCE_PATCH =
+            "{\"geometry\":{\"default\":\"geometry.humanoid.custom\"}}";
 
     private final SerializedSkin serialized;
     private final Source source;
@@ -31,18 +39,8 @@ final class BedrockSkin {
         if (requiredBoolean(clientData, "PersonaSkin")) {
             throw new IllegalArgumentException("Persona skins are not supported");
         }
-        rejectUnsupportedBase64(
-                clientData, "CapeData", limits.maxCapeBytes(), "Cape data");
-        rejectUnsupportedBase64(
-                clientData,
-                "SkinGeometryData",
-                limits.maxGeometryBytes(),
-                "Skin geometry data");
-        rejectUnsupportedText(
-                clientData,
-                "SkinGeometryDataEngineVersion",
-                limits.maxGeometryBytes(),
-                "Skin geometry engine version");
+        final Cape cape = cape(clientData, limits.maxCapeBytes());
+        final Geometry geometry = geometry(clientData, limits.maxGeometryBytes());
         final int width = requiredDimension(clientData, "SkinImageWidth");
         final int height = requiredDimension(clientData, "SkinImageHeight");
         if (width != WIDTH || (height != 32 && height != MAX_HEIGHT)) {
@@ -72,7 +70,7 @@ final class BedrockSkin {
             throw new IllegalArgumentException("Classic skin has an invalid arm size");
         }
         return new BedrockSkin(
-                serialize(skinId, width, height, pixels, armSize),
+                serialize(skinId, width, height, pixels, armSize, cape, geometry),
                 Source.BEDROCK_CLASSIC);
     }
 
@@ -93,7 +91,14 @@ final class BedrockSkin {
         }
         final String skinId = "minestom-generated:" + uuid;
         return new BedrockSkin(
-                serialize(skinId, WIDTH, MAX_HEIGHT, pixels, "wide"),
+                serialize(
+                        skinId,
+                        WIDTH,
+                        MAX_HEIGHT,
+                        pixels,
+                        "wide",
+                        Cape.EMPTY,
+                        Geometry.DEFAULT),
                 Source.GENERATED);
     }
 
@@ -106,19 +111,92 @@ final class BedrockSkin {
     }
 
     private static SerializedSkin serialize(
-            String skinId, int width, int height, byte[] pixels, String armSize) {
-        return SerializedSkin.of(
+            String skinId,
+            int width,
+            int height,
+            byte[] pixels,
+            String armSize,
+            Cape cape,
+            Geometry geometry) {
+        final SerializedSkin skin = SerializedSkin.of(
                         skinId,
                         "",
                         ImageData.of(width, height, pixels.clone()),
-                        ImageData.EMPTY,
-                        "geometry.humanoid.custom",
-                        "",
+                        cape.image(),
+                        geometry.data(),
+                        geometry.resourcePatch(),
                         false)
                 .toBuilder()
                 .armSize(armSize)
+                .capeId(cape.id())
+                .capeOnClassic(cape.onClassic())
+                .geometryDataEngineVersion(geometry.engineVersion())
                 .trusted(true)
                 .build();
+        if (skin.isValid()) return skin;
+        return skin.toBuilder()
+                .skinResourcePatch(CLASSIC_RESOURCE_PATCH)
+                .build();
+    }
+
+    private static Cape cape(Map<String, Object> values, int maximumBytes) {
+        final Object value = values.get("CapeData");
+        if (value == null) return Cape.EMPTY;
+        if (!(value instanceof String encoded)) {
+            throw new IllegalArgumentException("Cape data is not a string");
+        }
+        if (encoded.isEmpty()) return Cape.EMPTY;
+
+        final int allowedBytes = Math.min(maximumBytes, CAPE_PIXEL_BYTES);
+        final long maximumEncodedBytes = ((long) allowedBytes + 2) / 3 * 4;
+        if (encoded.length() > maximumEncodedBytes) {
+            throw new IllegalArgumentException("Cape data exceeds the login limit");
+        }
+        final byte[] pixels;
+        try {
+            pixels = Base64.getDecoder().decode(encoded);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException("Cape data is not valid base64", exception);
+        }
+        if (pixels.length > allowedBytes) {
+            throw new IllegalArgumentException("Cape data exceeds the login limit");
+        }
+
+        final int width = requiredDimension(values, "CapeImageWidth");
+        final int height = requiredDimension(values, "CapeImageHeight");
+        if (width != CAPE_WIDTH
+                || height != CAPE_HEIGHT
+                || pixels.length != CAPE_PIXEL_BYTES) {
+            throw new IllegalArgumentException("Cape data does not match classic dimensions");
+        }
+        final String id = optionalString(values, "CapeId", MAX_SKIN_ID_LENGTH);
+        final boolean onClassic = optionalBoolean(values, "CapeOnClassic");
+        return new Cape(
+                ImageData.of(width, height, pixels.clone()),
+                id,
+                onClassic);
+    }
+
+    private static Geometry geometry(Map<String, Object> values, int maximumBytes) {
+        return new Geometry(
+                optionalBase64Text(
+                        values,
+                        "SkinGeometryData",
+                        maximumBytes,
+                        "Skin geometry data",
+                        Geometry.DEFAULT.data()),
+                optionalText(
+                        values,
+                        "SkinGeometryDataEngineVersion",
+                        maximumBytes,
+                        "Skin geometry engine version",
+                        Geometry.DEFAULT.engineVersion()),
+                optionalBase64Text(
+                        values,
+                        "SkinResourcePatch",
+                        maximumBytes,
+                        "Skin resource patch",
+                        Geometry.DEFAULT.resourcePatch()));
     }
 
     private static int requiredDimension(Map<String, Object> values, String key) {
@@ -149,17 +227,42 @@ final class BedrockSkin {
         return result;
     }
 
-    private static void rejectUnsupportedBase64(
+    private static String optionalString(
+            Map<String, Object> values,
+            String key,
+            int maximumLength) {
+        final Object value = values.get(key);
+        if (value == null) return "";
+        if (!(value instanceof String result)) {
+            throw new IllegalArgumentException("Client data has invalid " + key);
+        }
+        if (result.length() > maximumLength) {
+            throw new IllegalArgumentException("Client data has overlong " + key);
+        }
+        return result;
+    }
+
+    private static boolean optionalBoolean(Map<String, Object> values, String key) {
+        final Object value = values.get(key);
+        if (value == null) return false;
+        if (!(value instanceof Boolean result)) {
+            throw new IllegalArgumentException("Client data has invalid " + key);
+        }
+        return result;
+    }
+
+    private static String optionalBase64Text(
             Map<String, Object> values,
             String key,
             int maximumBytes,
-            String label) {
+            String label,
+            String defaultValue) {
         final Object value = values.get(key);
-        if (value == null) return;
+        if (value == null) return defaultValue;
         if (!(value instanceof String encoded)) {
             throw new IllegalArgumentException(label + " is not a string");
         }
-        if (encoded.isEmpty()) return;
+        if (encoded.isEmpty()) return defaultValue;
         final long maximumEncodedBytes = ((long) maximumBytes + 2) / 3 * 4;
         if (encoded.length() > maximumEncodedBytes) {
             throw new IllegalArgumentException(label + " exceeds the login limit");
@@ -173,28 +276,47 @@ final class BedrockSkin {
         if (decoded.length > maximumBytes) {
             throw new IllegalArgumentException(label + " exceeds the login limit");
         }
-        throw new IllegalArgumentException(label + " is not supported");
+        try {
+            return StandardCharsets.UTF_8
+                    .newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(decoded))
+                    .toString();
+        } catch (CharacterCodingException exception) {
+            throw new IllegalArgumentException(label + " is not valid UTF-8", exception);
+        }
     }
 
-    private static void rejectUnsupportedText(
+    private static String optionalText(
             Map<String, Object> values,
             String key,
             int maximumBytes,
-            String label) {
+            String label,
+            String defaultValue) {
         final Object value = values.get(key);
-        if (value == null) return;
+        if (value == null) return defaultValue;
         if (!(value instanceof String text)) {
             throw new IllegalArgumentException(label + " is not a string");
         }
-        if (text.isEmpty()) return;
+        if (text.isEmpty()) return defaultValue;
         if (text.getBytes(StandardCharsets.UTF_8).length > maximumBytes) {
             throw new IllegalArgumentException(label + " exceeds the login limit");
         }
-        throw new IllegalArgumentException(label + " is not supported");
+        return text;
     }
 
     enum Source {
         BEDROCK_CLASSIC,
         GENERATED
+    }
+
+    private record Cape(ImageData image, String id, boolean onClassic) {
+        private static final Cape EMPTY = new Cape(ImageData.EMPTY, "", false);
+    }
+
+    private record Geometry(String data, String engineVersion, String resourcePatch) {
+        private static final Geometry DEFAULT =
+                new Geometry("", "0.0.0", CLASSIC_RESOURCE_PATCH);
     }
 }

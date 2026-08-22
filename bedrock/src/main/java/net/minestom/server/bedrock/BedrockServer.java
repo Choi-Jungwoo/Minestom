@@ -15,6 +15,8 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.minestom.server.ServerProcess;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.GlobalEventHandler;
+import net.minestom.server.event.EventDispatcher;
+import net.minestom.server.event.player.AsyncPlayerConfigurationEvent;
 import net.minestom.server.event.server.ServerListPingEvent;
 import net.minestom.server.instance.Instance;
 import net.minestom.server.network.ConnectionState;
@@ -32,6 +34,7 @@ import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.data.PacketCompressionAlgorithm;
 import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.netty.codec.batch.BedrockBatchDecoder;
+import org.cloudburstmc.protocol.bedrock.netty.codec.packet.BedrockPacketCodec;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockServerInitializer;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
@@ -363,16 +366,32 @@ public final class BedrockServer {
         }
     }
 
+    private void configureCodec(BedrockServerSession session, BedrockCodec codec) {
+        session.setCodec(codec);
+        final var helper = Objects.requireNonNull(
+                        session.getPeer()
+                                .getChannel()
+                                .pipeline()
+                                .get(BedrockPacketCodec.class),
+                        "Cloudburst Bedrock packet codec is missing")
+                .getHelper();
+        helper.setBlockDefinitions(mappings.blockDefinitionRegistry());
+        helper.setItemDefinitions(mappings.itemDefinitionRegistry());
+    }
+
     private void reportRejection(
             int protocol,
             String state,
             String packetType,
             Throwable cause) {
-        reportRejection(
-                protocol,
-                state,
-                packetType,
-                cause.getClass().getSimpleName());
+        final String causeType = cause.getClass().getSimpleName();
+        if (!diagnostics.rejection(protocol, state, packetType, causeType)) return;
+        process.exception().handleException(new IllegalStateException(
+                "Bedrock protocol failure protocol=" + protocol
+                        + " state=" + state
+                        + " packet=" + packetType
+                        + " cause=" + causeType,
+                cause));
     }
 
     private void reportRejection(
@@ -481,8 +500,10 @@ public final class BedrockServer {
         @Override
         protected void initSession(BedrockServerSession session) {
             server.sessions.add(session);
-            session.setCodec(Objects.requireNonNull(
-                    BedrockProtocol.codec(server.config.versionPolicy().primaryProtocol())));
+            server.configureCodec(
+                    session,
+                    Objects.requireNonNull(
+                            BedrockProtocol.codec(server.config.versionPolicy().primaryProtocol())));
             final HandshakeHandler handler = new HandshakeHandler(server, session);
             session.setPacketHandler(handler);
             final var pipeline = session.getPeer().getChannel().pipeline();
@@ -592,7 +613,7 @@ public final class BedrockServer {
                 return PacketSignal.HANDLED;
             }
 
-            session.setCodec(codec);
+            server.configureCodec(session, codec);
             final NetworkSettingsPacket response = new NetworkSettingsPacket();
             response.setCompressionAlgorithm(PacketCompressionAlgorithm.ZLIB);
             response.setCompressionThreshold(512);
@@ -786,18 +807,16 @@ public final class BedrockServer {
 
                 @Override
                 public CompletableFuture<Void> prepare(Player player) {
-                    final BedrockMappings mappings = Objects.requireNonNull(
-                            server.mappings, "Bedrock mappings were not loaded");
-                    player.setPendingOptions(server.config.spawningInstance(), false);
+                    final var event = new AsyncPlayerConfigurationEvent(player, true);
+                    event.setSpawningInstance(server.config.spawningInstance());
+                    EventDispatcher.call(event);
+                    final Instance spawningInstance = Objects.requireNonNull(
+                            event.getSpawningInstance(),
+                            "Bedrock player configuration requires a spawning instance");
+                    player.setPendingOptions(spawningInstance, event.isHardcore());
                     connection.setClientState(ConnectionState.PLAY);
                     connection.setServerState(ConnectionState.PLAY);
-                    connection.initializeInstance(server.config.spawningInstance());
-                    connection.sendBedrockPacket(BedrockStartGame.create(
-                            player,
-                            server.config.spawningInstance(),
-                            server.process,
-                            mappings,
-                            connection.getProtocolVersion()));
+                    connection.initializeInstance(spawningInstance);
                     return CompletableFuture.completedFuture(null);
                 }
             };

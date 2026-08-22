@@ -7,8 +7,10 @@ import net.minestom.server.ServerProcess;
 import net.minestom.server.component.DataComponents;
 import net.minestom.server.coordinate.CoordConversion;
 import net.minestom.server.coordinate.Pos;
+import net.minestom.server.coordinate.Vec;
 import net.minestom.server.entity.EntityType;
 import net.minestom.server.entity.EquipmentSlot;
+import net.minestom.server.entity.GameMode;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.EventDispatcher;
 import net.minestom.server.event.player.OutgoingTransferEvent;
@@ -19,6 +21,8 @@ import net.minestom.server.network.ConnectionState;
 import net.minestom.server.network.packet.client.common.ClientKeepAlivePacket;
 import net.minestom.server.network.packet.client.play.ClientChatMessagePacket;
 import net.minestom.server.network.packet.client.play.ClientCommandChatPacket;
+import net.minestom.server.network.packet.client.play.ClientPlayerAbilitiesPacket;
+import net.minestom.server.network.packet.client.play.ClientPlayerActionPacket;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
 import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
 import net.minestom.server.network.packet.server.BufferedPacket;
@@ -26,6 +30,7 @@ import net.minestom.server.network.packet.server.CachedPacket;
 import net.minestom.server.network.packet.server.FramedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.packet.server.common.KeepAlivePacket;
+import net.minestom.server.network.packet.server.play.AcknowledgeBlockChangePacket;
 import net.minestom.server.network.packet.server.play.BlockChangePacket;
 import net.minestom.server.network.packet.server.play.ChangeGameStatePacket;
 import net.minestom.server.network.packet.server.play.ChunkBatchFinishedPacket;
@@ -67,12 +72,15 @@ import net.minestom.server.network.packet.server.play.WindowItemsPacket;
 import net.minestom.server.network.player.PlayerConnection;
 import net.minestom.server.utils.position.PositionUtils;
 import net.minestom.server.world.DimensionType;
+import net.minestom.server.instance.block.BlockFace;
 import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.math.vector.Vector3i;
 import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.data.BuildPlatform;
 import org.cloudburstmc.protocol.bedrock.data.ClientPlayMode;
 import org.cloudburstmc.protocol.bedrock.data.GameType;
+import org.cloudburstmc.protocol.bedrock.data.Ability;
+import org.cloudburstmc.protocol.bedrock.data.AbilityLayer;
 import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.data.PlayerAuthInputData;
 import org.cloudburstmc.protocol.bedrock.data.PlayerPermission;
@@ -101,6 +109,8 @@ import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
 import org.cloudburstmc.protocol.bedrock.packet.TransferPacket;
+import org.cloudburstmc.protocol.bedrock.packet.UpdateAbilitiesPacket;
+import org.cloudburstmc.protocol.bedrock.packet.UpdateAdventureSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.jetbrains.annotations.Nullable;
 
@@ -110,11 +120,13 @@ import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.BitSet;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -133,8 +145,8 @@ public final class BedrockConnection extends PlayerConnection {
     private static final Component UNSUPPORTED_CRITICAL_PACKET =
             Component.text("Unsupported critical Bedrock packet");
     private static final Set<Class<?>> INTENTIONALLY_IGNORED_PACKETS = Set.of(
+            AcknowledgeBlockChangePacket.class,
             ChangeGameStatePacket.class,
-            ChunkBatchFinishedPacket.class,
             ChunkBatchStartPacket.class,
             DeclareCommandsPacket.class,
             DeclareRecipesPacket.class,
@@ -144,8 +156,6 @@ public final class BedrockConnection extends PlayerConnection {
             EntityVelocityPacket.class,
             HeldItemChangePacket.class,
             InitializeWorldBorderPacket.class,
-            JoinGamePacket.class,
-            PlayerAbilitiesPacket.class,
             RecipeBookAddPacket.class,
             RecipeBookRemovePacket.class,
             RecipeBookSettingsPacket.class,
@@ -159,6 +169,8 @@ public final class BedrockConnection extends PlayerConnection {
             WindowItemsPacket.class);
     private static final float TELEPORT_CONFIRM_TOLERANCE = 0.1f;
     private static final int TELEPORT_RESEND_INPUTS = 20;
+    private static final Set<ClientPlayMode> SUPPORTED_MOVEMENT_PLAY_MODES =
+            EnumSet.of(ClientPlayMode.NORMAL, ClientPlayMode.SCREEN);
     private static final Set<PlayerAuthInputData> UNSUPPORTED_MOVEMENT_INPUTS = EnumSet.of(
             PlayerAuthInputData.ASCEND,
             PlayerAuthInputData.DESCEND,
@@ -170,8 +182,6 @@ public final class BedrockConnection extends PlayerConnection {
             PlayerAuthInputData.STOP_CRAWLING,
             PlayerAuthInputData.START_SPIN_ATTACK,
             PlayerAuthInputData.STOP_SPIN_ATTACK,
-            PlayerAuthInputData.START_FLYING,
-            PlayerAuthInputData.STOP_FLYING,
             PlayerAuthInputData.IN_CLIENT_PREDICTED_IN_VEHICLE);
 
     private final BedrockServerSession session;
@@ -183,6 +193,8 @@ public final class BedrockConnection extends PlayerConnection {
     private final BedrockDiagnostics diagnostics;
     private final Map<Integer, UUID> visiblePlayerUuids = new ConcurrentHashMap<>();
     private final AtomicBoolean disconnected = new AtomicBoolean();
+    private final AtomicBoolean startGameSent = new AtomicBoolean();
+    private final AtomicBoolean initialSpawnSent = new AtomicBoolean();
     private final AtomicInteger pendingDimensionChanges = new AtomicInteger();
     private final AtomicReference<PendingTeleport> pendingTeleport = new AtomicReference<>();
     private volatile long lastClientTick = -1;
@@ -229,8 +241,14 @@ public final class BedrockConnection extends PlayerConnection {
         }
         try {
             final TranslationOutcome outcome;
-            if (packet instanceof KeepAlivePacket keepAlive) {
+            if (packet instanceof JoinGamePacket) {
+                sendStartGame();
+                outcome = TranslationOutcome.TRANSLATED;
+            } else if (packet instanceof KeepAlivePacket keepAlive) {
                 sendKeepAlive(keepAlive);
+                outcome = TranslationOutcome.TRANSLATED;
+            } else if (packet instanceof ChunkBatchFinishedPacket) {
+                sendInitialSpawn();
                 outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof BlockChangePacket change) {
                 sendBlockUpdate(
@@ -282,6 +300,9 @@ public final class BedrockConnection extends PlayerConnection {
             } else if (packet instanceof EntityEquipmentPacket equipment) {
                 sendPlayerEquipment(equipment);
                 outcome = TranslationOutcome.TRANSLATED;
+            } else if (packet instanceof PlayerAbilitiesPacket abilities) {
+                sendPlayerAbilities(abilities);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (INTENTIONALLY_IGNORED_PACKETS.contains(packet.getClass())) {
                 outcome = TranslationOutcome.INTENTIONALLY_IGNORED;
             } else {
@@ -323,8 +344,11 @@ public final class BedrockConnection extends PlayerConnection {
         final ByteBuf validationBuffer = session.getPeer().getChannel().alloc().buffer();
         boolean submitted = false;
         try {
+            final var helper = session.getCodec().createHelper();
+            helper.setBlockDefinitions(mappings.blockDefinitionRegistry());
+            helper.setItemDefinitions(mappings.itemDefinitionRegistry());
             session.getCodec().tryEncode(
-                    session.getCodec().createHelper(), validationBuffer, packet);
+                    helper, validationBuffer, packet);
             session.sendPacket(packet);
             submitted = true;
         } finally {
@@ -341,9 +365,12 @@ public final class BedrockConnection extends PlayerConnection {
     void handle(PlayerAuthInputPacket packet) {
         final Player player = getPlayer();
         if (player == null || player.getInstance() == null || disconnected.get()) return;
-        if (packet.getPlayMode() != ClientPlayMode.NORMAL
+        final Set<PlayerAuthInputData> unsupportedInputs =
+                EnumSet.copyOf(packet.getInputData());
+        unsupportedInputs.retainAll(UNSUPPORTED_MOVEMENT_INPUTS);
+        if (!SUPPORTED_MOVEMENT_PLAY_MODES.contains(packet.getPlayMode())
                 || packet.getPredictedVehicle() != 0
-                || packet.getInputData().stream().anyMatch(UNSUPPORTED_MOVEMENT_INPUTS::contains)) {
+                || !unsupportedInputs.isEmpty()) {
             kick(UNSUPPORTED_MOVEMENT);
             return;
         }
@@ -351,6 +378,8 @@ public final class BedrockConnection extends PlayerConnection {
         if (tick <= lastClientTick) return;
         lastClientTick = tick;
         if (handlePendingTeleport(player, packet)) return;
+        handleAbilityInputs(player, packet);
+        handleBlockActions(player, packet, tick);
 
         final Vector3f position = packet.getPosition();
         final Vector3f rotation = packet.getRotation();
@@ -364,6 +393,53 @@ public final class BedrockConnection extends PlayerConnection {
                 feetPosition,
                 packet.getInputData().contains(PlayerAuthInputData.VERTICAL_COLLISION),
                 packet.getInputData().contains(PlayerAuthInputData.HORIZONTAL_COLLISION)));
+    }
+
+    private static void handleAbilityInputs(Player player, PlayerAuthInputPacket packet) {
+        final boolean startFlying =
+                packet.getInputData().contains(PlayerAuthInputData.START_FLYING);
+        final boolean stopFlying =
+                packet.getInputData().contains(PlayerAuthInputData.STOP_FLYING);
+        if (startFlying == stopFlying) return;
+        final byte flags = startFlying ? PlayerAbilitiesPacket.FLAG_FLYING : 0;
+        player.addPacketToQueue(new ClientPlayerAbilitiesPacket(flags));
+    }
+
+    private static void handleBlockActions(
+            Player player, PlayerAuthInputPacket packet, long tick) {
+        final int sequence = (int) Math.min(Integer.MAX_VALUE, tick);
+        final BlockFace[] blockFaces = BlockFace.values();
+        for (var action : packet.getPlayerActions()) {
+            final ClientPlayerActionPacket.Status status =
+                    javaAction(player, action.getAction());
+            final Vector3i position = action.getBlockPosition();
+            final int face = action.getFace();
+            if (status == null || position == null
+                    || face < 0 || face >= blockFaces.length) {
+                continue;
+            }
+            player.addPacketToQueue(new ClientPlayerActionPacket(
+                    status,
+                    new Vec(position.getX(), position.getY(), position.getZ()),
+                    blockFaces[face],
+                    sequence));
+        }
+    }
+
+    private static @Nullable ClientPlayerActionPacket.Status javaAction(
+            Player player, @Nullable PlayerActionType action) {
+        if (action == null) return null;
+        return switch (action) {
+            case START_BREAK -> ClientPlayerActionPacket.Status.STARTED_DIGGING;
+            case ABORT_BREAK -> ClientPlayerActionPacket.Status.CANCELLED_DIGGING;
+            case STOP_BREAK, BLOCK_PREDICT_DESTROY ->
+                    ClientPlayerActionPacket.Status.FINISHED_DIGGING;
+            case DIMENSION_CHANGE_REQUEST_OR_CREATIVE_DESTROY_BLOCK ->
+                    player.getGameMode() == GameMode.CREATIVE
+                            ? ClientPlayerActionPacket.Status.STARTED_DIGGING
+                            : null;
+            default -> null;
+        };
     }
 
     void handle(TextPacket packet) {
@@ -399,14 +475,47 @@ public final class BedrockConnection extends PlayerConnection {
 
     void handle(NetworkStackLatencyPacket packet) {
         final Player player = getPlayer();
-        if (player == null || packet.isFromServer()) return;
-        player.addPacketToQueue(new ClientKeepAlivePacket(packet.getTimestamp()));
+        if (player == null || !packet.isFromServer()) return;
+        final long expectedTimestamp =
+                TimeUnit.NANOSECONDS.toMillis(player.getLastKeepAlive());
+        final long receivedTimestamp =
+                TimeUnit.NANOSECONDS.toMillis(packet.getTimestamp());
+        final long keepAliveId = receivedTimestamp == expectedTimestamp
+                ? player.getLastKeepAlive()
+                : packet.getTimestamp();
+        player.addPacketToQueue(new ClientKeepAlivePacket(keepAliveId));
     }
 
     void handleDimensionChangeSuccess() {
         final int previous = pendingDimensionChanges.getAndUpdate(
                 current -> Math.max(0, current - 1));
         if (previous != 1) return;
+        sendPlayerSpawn();
+    }
+
+    private void sendInitialSpawn() {
+        if (initialSpawnSent.compareAndSet(false, true)) {
+            sendPlayerSpawn();
+        }
+    }
+
+    private void sendStartGame() {
+        if (!startGameSent.compareAndSet(false, true)) return;
+        final Player player = Objects.requireNonNull(getPlayer(), "Bedrock player was not admitted");
+        final UUID targetInstanceId =
+                Objects.requireNonNull(instanceId, "Bedrock spawning instance was not initialized");
+        final Instance instance = Objects.requireNonNull(
+                process.instance().getInstance(targetInstanceId),
+                "Bedrock spawning instance is no longer registered");
+        sendBedrockPacket(BedrockStartGame.create(
+                player,
+                instance,
+                process,
+                mappings,
+                getProtocolVersion()));
+    }
+
+    private void sendPlayerSpawn() {
         final PlayStatusPacket status = new PlayStatusPacket();
         status.setStatus(PlayStatusPacket.Status.PLAYER_SPAWN);
         sendBedrockPacket(status);
@@ -472,9 +581,50 @@ public final class BedrockConnection extends PlayerConnection {
 
     private void sendKeepAlive(KeepAlivePacket keepAlive) {
         final NetworkStackLatencyPacket packet = new NetworkStackLatencyPacket();
-        packet.setTimestamp(keepAlive.id());
+        packet.setTimestamp(TimeUnit.NANOSECONDS.toMillis(keepAlive.id()));
         packet.setFromServer(true);
         sendBedrockPacket(packet);
+    }
+
+    private void sendPlayerAbilities(PlayerAbilitiesPacket abilities) {
+        final Player player = getPlayer();
+        if (player == null) return;
+
+        final UpdateAdventureSettingsPacket settings = new UpdateAdventureSettingsPacket();
+        settings.setAutoJump(true);
+        settings.setShowNameTags(true);
+        sendBedrockPacket(settings);
+
+        final AbilityLayer layer = new AbilityLayer();
+        layer.setLayerType(AbilityLayer.Type.BASE);
+        layer.getAbilitiesSet().addAll(EnumSet.allOf(Ability.class));
+        layer.getAbilityValues().addAll(EnumSet.of(
+                Ability.BUILD,
+                Ability.MINE,
+                Ability.DOORS_AND_SWITCHES,
+                Ability.OPEN_CONTAINERS));
+        if ((abilities.flags() & PlayerAbilitiesPacket.FLAG_INVULNERABLE) != 0) {
+            layer.getAbilityValues().add(Ability.INVULNERABLE);
+        }
+        if ((abilities.flags() & PlayerAbilitiesPacket.FLAG_FLYING) != 0) {
+            layer.getAbilityValues().add(Ability.FLYING);
+        }
+        if ((abilities.flags() & PlayerAbilitiesPacket.FLAG_ALLOW_FLYING) != 0) {
+            layer.getAbilityValues().add(Ability.MAY_FLY);
+        }
+        if ((abilities.flags() & PlayerAbilitiesPacket.FLAG_INSTANT_BREAK) != 0) {
+            layer.getAbilityValues().add(Ability.INSTABUILD);
+        }
+        layer.setFlySpeed(abilities.flyingSpeed());
+        layer.setWalkSpeed(Math.max(0.01f, abilities.walkingSpeed()));
+        layer.setVerticalFlySpeed(1);
+
+        final UpdateAbilitiesPacket update = new UpdateAbilitiesPacket();
+        update.setUniqueEntityId(player.getEntityId());
+        update.setPlayerPermission(PlayerPermission.MEMBER);
+        update.setCommandPermission(CommandPermission.ANY);
+        update.setAbilityLayers(List.of(layer));
+        sendBedrockPacket(update);
     }
 
     private void sendBlockUpdates(MultiBlockChangePacket changes) {
@@ -559,13 +709,14 @@ public final class BedrockConnection extends PlayerConnection {
         for (PlayerInfoUpdatePacket.Entry player : packet.entries()) {
             final Player visiblePlayer = findPlayer(player.uuid());
             final PlayerListPacket.Entry entry = new PlayerListPacket.Entry(player.uuid());
+            final SerializedSkin skin = displaySkin(visiblePlayer, player.uuid());
             entry.setAction(PlayerListPacket.Action.ADD);
             entry.setEntityId(visiblePlayer == null ? 0 : visiblePlayer.getEntityId());
             entry.setName(player.username());
             entry.setXuid("");
             entry.setPlatformChatId("");
             entry.setBuildPlatform(BuildPlatform.UNKNOWN);
-            entry.setSkin(displaySkin(visiblePlayer, player.uuid()));
+            entry.setSkin(skin);
             entry.setColor(new Color(0, true));
             list.getEntries().add(entry);
         }

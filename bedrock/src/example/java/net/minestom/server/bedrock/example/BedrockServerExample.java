@@ -6,6 +6,7 @@ import net.minestom.server.ServerProcess;
 import net.minestom.server.bedrock.BedrockServer;
 import net.minestom.server.bedrock.BedrockServerConfig;
 import net.minestom.server.coordinate.Pos;
+import net.minestom.server.entity.GameMode;
 import net.minestom.server.event.player.AsyncPlayerConfigurationEvent;
 import net.minestom.server.instance.InstanceContainer;
 import net.minestom.server.instance.block.Block;
@@ -18,7 +19,8 @@ public final class BedrockServerExample {
     private static final String BIND_ADDRESS = "0.0.0.0";
     private static final int BEDROCK_PORT = 19132;
     private static final int JAVA_PORT = 25565;
-    private static final Pos SPAWN_POSITION = new Pos(0.5, 41, 0.5);
+    private static final int MOBILE_VIEW_DISTANCE = 2;
+    private static final Pos SPAWN_POSITION = new Pos(0.5, 44, 0.5);
 
     private BedrockServerExample() {
     }
@@ -32,6 +34,7 @@ public final class BedrockServerExample {
         final MinecraftServer minecraftServer = MinecraftServer.init(new Auth.Offline());
         final ServerProcess process = Objects.requireNonNull(MinecraftServer.process());
         final InstanceContainer instance = process.instance().createInstanceContainer();
+        instance.viewDistance(MOBILE_VIEW_DISTANCE);
         instance.setGenerator(unit -> {
             unit.modifier().fillHeight(0, 40, Block.DIRT);
             unit.modifier().fillHeight(40, 41, Block.GRASS_BLOCK);
@@ -39,6 +42,7 @@ public final class BedrockServerExample {
 
         process.eventHandler().addListener(AsyncPlayerConfigurationEvent.class, event -> {
             event.setSpawningInstance(instance);
+            event.getPlayer().setGameMode(GameMode.CREATIVE);
             event.getPlayer().setRespawnPoint(SPAWN_POSITION);
         });
 

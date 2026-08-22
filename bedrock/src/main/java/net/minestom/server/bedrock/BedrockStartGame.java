@@ -37,10 +37,11 @@ final class BedrockStartGame {
 
         final var position = player.getRespawnPoint();
         final long entityId = player.getEntityId();
+        final GameType gameType = gameType(player);
         final StartGamePacket packet = new StartGamePacket();
         packet.setUniqueEntityId(entityId);
         packet.setRuntimeEntityId(entityId);
-        packet.setPlayerGameType(GameType.SURVIVAL);
+        packet.setPlayerGameType(gameType);
         packet.setPlayerPosition(Vector3f.from(
                 position.x(), position.y() + PLAYER_EYE_HEIGHT, position.z()));
         packet.setRotation(Vector2f.from(position.yaw(), position.pitch()));
@@ -49,7 +50,7 @@ final class BedrockStartGame {
         packet.setCustomBiomeName("");
         packet.setDimensionId(dimensionId(instance, registries));
         packet.setGeneratorId(1);
-        packet.setLevelGameType(GameType.SURVIVAL);
+        packet.setLevelGameType(gameType);
         packet.setDifficulty(1);
         packet.setDefaultSpawn(Vector3i.from(
                 position.blockX(), position.blockY(), position.blockZ()));
@@ -81,6 +82,15 @@ final class BedrockStartGame {
         packet.setScenarioId("");
         packet.setOwnerId("");
         return packet;
+    }
+
+    private static GameType gameType(Player player) {
+        return switch (player.getGameMode()) {
+            case SURVIVAL -> GameType.SURVIVAL;
+            case CREATIVE -> GameType.CREATIVE;
+            case ADVENTURE -> GameType.ADVENTURE;
+            case SPECTATOR -> GameType.SPECTATOR;
+        };
     }
 
     static int dimensionId(Instance instance, Registries registries) {

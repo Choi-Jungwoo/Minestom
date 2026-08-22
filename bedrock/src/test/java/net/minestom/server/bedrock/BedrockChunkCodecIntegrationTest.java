@@ -44,4 +44,24 @@ public class BedrockChunkCodecIntegrationTest {
             packet.release();
         }
     }
+
+    @Test
+    void omitsTheFixedSizeForSingletonStorages() {
+        var packet = BedrockChunkCodec.encodeEmptyChunk(
+                UnpooledByteBufAllocator.DEFAULT,
+                0,
+                0,
+                1,
+                42,
+                0);
+        try {
+            var data = packet.getData().duplicate();
+            assertEquals(1, data.readUnsignedByte());
+            assertEquals(42, VarInts.readInt(data));
+            assertEquals(0, data.readUnsignedByte());
+            assertEquals(0, data.readableBytes());
+        } finally {
+            packet.release();
+        }
+    }
 }

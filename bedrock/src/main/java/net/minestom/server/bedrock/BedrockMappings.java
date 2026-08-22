@@ -14,6 +14,9 @@ import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.ItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleItemDefinition;
+import org.cloudburstmc.protocol.common.Definition;
+import org.cloudburstmc.protocol.common.DefinitionRegistry;
+import org.cloudburstmc.protocol.common.SimpleDefinitionRegistry;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,6 +30,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -71,6 +75,8 @@ final class BedrockMappings {
     private final RegistryCoverage coverage;
     private final List<BlockDefinition> blockDefinitions;
     private final Map<String, ItemDefinition> itemDefinitionsByJavaKey;
+    private final DefinitionRegistry<BlockDefinition> blockDefinitionRegistry;
+    private final DefinitionRegistry<ItemDefinition> itemDefinitionRegistry;
 
     private BedrockMappings(
             Release release,
@@ -84,6 +90,20 @@ final class BedrockMappings {
                 .collect(Collectors.toUnmodifiableMap(
                         ItemDefinition::getIdentifier,
                         definition -> definition));
+        this.blockDefinitionRegistry = SimpleDefinitionRegistry.<BlockDefinition>builder()
+                .addAll(uniqueDefinitions(blockDefinitions))
+                .build();
+        this.itemDefinitionRegistry = SimpleDefinitionRegistry.<ItemDefinition>builder()
+                .addAll(uniqueDefinitions(itemDefinitions))
+                .build();
+    }
+
+    private static <D extends Definition> List<D> uniqueDefinitions(List<D> definitions) {
+        final Map<Integer, D> definitionsByRuntimeId = new LinkedHashMap<>();
+        for (D definition : definitions) {
+            definitionsByRuntimeId.putIfAbsent(definition.getRuntimeId(), definition);
+        }
+        return List.copyOf(definitionsByRuntimeId.values());
     }
 
     static BedrockMappings testing(Registries registries) {
@@ -474,6 +494,14 @@ final class BedrockMappings {
                     "No Bedrock mapping for Minestom item " + javaKey);
         }
         return definition;
+    }
+
+    DefinitionRegistry<BlockDefinition> blockDefinitionRegistry() {
+        return blockDefinitionRegistry;
+    }
+
+    DefinitionRegistry<ItemDefinition> itemDefinitionRegistry() {
+        return itemDefinitionRegistry;
     }
 
     int biomeId(int javaBiomeId, Registry<?> biomeRegistry) {

@@ -19,7 +19,9 @@ import net.minestom.server.coordinate.Pos;
 import net.minestom.server.entity.Entity;
 import net.minestom.server.entity.EntityType;
 import net.minestom.server.entity.EquipmentSlot;
+import net.minestom.server.entity.GameMode;
 import net.minestom.server.entity.Player;
+import net.minestom.server.event.player.AsyncPlayerConfigurationEvent;
 import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
 import net.minestom.server.event.player.PlayerChatEvent;
 import net.minestom.server.event.player.PlayerDisconnectEvent;
@@ -40,12 +42,17 @@ import org.cloudburstmc.netty.channel.raknet.RakChannelFactory;
 import org.cloudburstmc.netty.channel.raknet.config.RakChannelOption;
 import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.protocol.bedrock.BedrockClientSession;
+import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.codec.v1001.Bedrock_v1001;
+import org.cloudburstmc.protocol.bedrock.codec.v2168.Bedrock_v2168;
+import org.cloudburstmc.protocol.bedrock.data.Ability;
 import org.cloudburstmc.protocol.bedrock.data.ClientPlayMode;
+import org.cloudburstmc.protocol.bedrock.data.GameType;
 import org.cloudburstmc.protocol.bedrock.data.InputInteractionModel;
 import org.cloudburstmc.protocol.bedrock.data.InputMode;
 import org.cloudburstmc.protocol.bedrock.data.PlayerAuthInputData;
 import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
+import org.cloudburstmc.protocol.bedrock.data.PlayerBlockActionData;
 import org.cloudburstmc.protocol.bedrock.data.auth.AuthType;
 import org.cloudburstmc.protocol.bedrock.data.auth.CertificateChainPayload;
 import org.cloudburstmc.protocol.bedrock.data.command.CommandOriginData;
@@ -55,6 +62,8 @@ import org.cloudburstmc.protocol.bedrock.data.definitions.ItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataTypes;
+import org.cloudburstmc.protocol.bedrock.data.inventory.ItemData;
+import org.cloudburstmc.protocol.bedrock.data.inventory.transaction.ItemUseTransaction;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockClientInitializer;
 import org.cloudburstmc.protocol.bedrock.netty.codec.packet.BedrockPacketCodec;
 import org.cloudburstmc.protocol.bedrock.packet.AddEntityPacket;
@@ -84,6 +93,7 @@ import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
 import org.cloudburstmc.protocol.bedrock.packet.TransferPacket;
+import org.cloudburstmc.protocol.bedrock.packet.UpdateAbilitiesPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.cloudburstmc.protocol.common.PacketSignal;
@@ -100,6 +110,7 @@ import org.junit.jupiter.api.Test;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -119,6 +130,7 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -151,15 +163,22 @@ public class BedrockLoginHandshakeTest {
     @Test
     @Tag("bedrock-acceptance")
     void validOfflineLoginCompletesEncryptedEmptyResourcePackHandshake() throws Exception {
+        final Pos configuredSpawn = new Pos(0.5, 41, 0.5);
+        process.eventHandler().addListener(
+                AsyncPlayerConfigurationEvent.class,
+                event -> event.getPlayer().setRespawnPoint(configuredSpawn));
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
-            assertEquals(PlayStatusPacket.Status.LOGIN_SUCCESS, client.playStatus);
+            assertLoginCompletes(client);
+            assertTrue(client.loginSuccessReceived);
             assertTrue(client.resourcePacksInfoEmpty);
             assertTrue(client.resourcePackStackEmpty);
             assertTrue(client.startGameReceived, () -> client.stage);
+            assertEquals(
+                    Vector3f.from(0.5, 41 + BedrockStartGame.PLAYER_EYE_HEIGHT, 0.5),
+                    client.startGamePosition);
 
             Player player = awaitPlayer();
             assertInstanceOf(BedrockConnection.class, player.getPlayerConnection());
@@ -167,6 +186,8 @@ public class BedrockLoginHandshakeTest {
                     UUID.fromString("0c7651f2-577a-3b92-8ff9-3faa54136489"),
                     player.getUuid());
             assertSame(server.spawningInstance(), player.getInstance());
+            assertTrue(tickUntil(() ->
+                    client.playStatus == PlayStatusPacket.Status.PLAYER_SPAWN));
         }
     }
 
@@ -179,7 +200,7 @@ public class BedrockLoginHandshakeTest {
                 Credentials.INVALID_RESOURCE_PACK_ORDER)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             assertEquals(
                     "disconnected: Invalid Bedrock resource-pack handshake",
                     client.stage);
@@ -192,8 +213,30 @@ public class BedrockLoginHandshakeTest {
                      new LoginClient(server.boundAddress(), "GuestPlayer", AuthType.GUEST, Credentials.VALID)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
-            assertEquals(PlayStatusPacket.Status.LOGIN_SUCCESS, client.playStatus);
+            assertLoginCompletes(client);
+            assertTrue(client.loginSuccessReceived);
+        }
+    }
+
+    @Test
+    void validClassicCapeDoesNotBlockLogin() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "CapePlayer", AuthType.SELF_SIGNED, Credentials.VALID_CAPE)) {
+            client.begin();
+
+            assertLoginCompletes(client);
+            assertTrue(client.loginSuccessReceived);
+        }
+    }
+
+    @Test
+    void validClassicGeometryDoesNotBlockLogin() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "GeometryPlayer", AuthType.SELF_SIGNED, Credentials.VALID_GEOMETRY)) {
+            client.begin();
+
+            assertLoginCompletes(client);
+            assertTrue(client.loginSuccessReceived);
         }
     }
 
@@ -206,7 +249,7 @@ public class BedrockLoginHandshakeTest {
                 server.boundAddress(), "Original", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             Player player = awaitPlayer();
             assertEquals(replacementUuid, player.getUuid());
             assertEquals("Replacement", player.getUsername());
@@ -220,10 +263,10 @@ public class BedrockLoginHandshakeTest {
              var second = new LoginClient(
                      server.boundAddress(), "Duplicate", AuthType.SELF_SIGNED, Credentials.VALID)) {
             first.begin();
-            assertTrue(first.completed.await(3, TimeUnit.SECONDS), () -> first.stage);
+            assertLoginCompletes(first);
 
             second.begin();
-            assertTrue(second.completed.await(3, TimeUnit.SECONDS), () -> second.stage);
+            assertLoginCompletes(second);
             assertEquals("disconnected: §cError during login!", second.stage);
         }
     }
@@ -262,7 +305,7 @@ public class BedrockLoginHandshakeTest {
                 Credentials.VALID)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             assertEquals("disconnected: Invalid Bedrock login", client.stage);
         }
     }
@@ -275,6 +318,90 @@ public class BedrockLoginHandshakeTest {
     @Test
     void rejectsOversizedSkin() throws Exception {
         assertLoginRejected(Credentials.OVERSIZED_SKIN);
+    }
+
+    @Test
+    void classicSkinSerializationUsesValidResourcePatch() {
+        final var skin = BedrockSkin.classic(
+                Map.of(
+                        "PersonaSkin", false,
+                        "SkinImageWidth", 64,
+                        "SkinImageHeight", 64,
+                        "SkinData", Base64.getEncoder().encodeToString(CLASSIC_SKIN),
+                        "SkinId", "test-classic",
+                        "ArmSize", "wide",
+                        "SkinResourcePatch",
+                                Base64.getEncoder().encodeToString(
+                                        "{}".getBytes(StandardCharsets.UTF_8))),
+                BedrockServerLimits.defaults());
+
+        assertTrue(skin.serialized().isValid());
+    }
+
+    @Test
+    @Tag("bedrock-acceptance")
+    void v2168ItemInteractionUsesTheMappingDefinitionRegistries() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(),
+                "MapInteract",
+                AuthType.SELF_SIGNED,
+                Credentials.VALID,
+                Bedrock_v2168.CODEC)) {
+            client.begin();
+            assertLoginCompletes(client);
+            Player player = awaitPlayer();
+
+            client.interactWithBlock(
+                    player.getPosition(), 1, Vector3i.ZERO, Block.STONE.stateId());
+            for (int attempt = 0; attempt < 20; attempt++) {
+                tick();
+                Thread.sleep(10);
+            }
+
+            assertTrue(client.session.isConnected());
+            assertTrue(
+                    client.disconnects.isEmpty(),
+                    () -> "stage: " + client.stage + ", disconnects: " + client.disconnects);
+        }
+    }
+
+    @Test
+    @Tag("bedrock-acceptance")
+    void creativeBedrockPlayerCanBreakBlocksAndFly() throws Exception {
+        final var instance = server.spawningInstance();
+        instance.loadChunk(0, 0).join();
+        instance.setBlock(0, 0, 0, Block.STONE);
+        process.eventHandler().addListener(AsyncPlayerConfigurationEvent.class, event -> {
+            event.getPlayer().setGameMode(GameMode.CREATIVE);
+            event.getPlayer().setRespawnPoint(new Pos(0.5, 44, 0.5));
+        });
+
+        try (var client = new LoginClient(
+                server.boundAddress(),
+                "CreativePlayer",
+                AuthType.SELF_SIGNED,
+                Credentials.VALID,
+                Bedrock_v2168.CODEC)) {
+            client.begin();
+            assertLoginCompletes(client);
+            Player player = awaitPlayer();
+
+            assertEquals(GameType.CREATIVE, client.startGameType);
+            assertTrue(tickUntil(() -> client.abilities.stream().anyMatch(packet ->
+                    packet.getAbilityLayers().stream().anyMatch(layer ->
+                            layer.getAbilityValues().contains(Ability.MAY_FLY)
+                                    && layer.getAbilityValues().contains(Ability.INSTABUILD)))));
+
+            client.move(player.getPosition(), 1, PlayerAuthInputData.HANDLE_TELEPORT);
+            assertTrue(tickUntil(() ->
+                    player.getLastSentTeleportId() == player.getLastReceivedTeleportId()));
+
+            client.breakBlock(player.getPosition(), 2, Vector3i.ZERO);
+            assertTrue(tickUntil(() -> instance.getBlock(0, 0, 0) == Block.AIR));
+
+            client.move(player.getPosition(), 3, PlayerAuthInputData.START_FLYING);
+            assertTrue(tickUntil(player::isFlying));
+        }
     }
 
     @Test
@@ -291,7 +418,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "WorldPlayer", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             Player player = awaitPlayer();
 
             assertTrue(tickUntil(() -> client.chunks.stream()
@@ -301,7 +428,7 @@ public class BedrockLoginHandshakeTest {
             assertTrue(tickUntil(() ->
                     player.getLastSentTeleportId() == player.getLastReceivedTeleportId()));
 
-            client.move(new Pos(17, 0, 0), 2);
+            client.move(new Pos(17, 0, 0), 2, ClientPlayMode.SCREEN);
             assertTrue(tickUntil(() -> player.getPosition().x() == 17));
             assertTrue(tickUntil(() -> client.chunks.stream()
                     .anyMatch(chunk -> chunk.subChunks() == 0)));
@@ -352,8 +479,12 @@ public class BedrockLoginHandshakeTest {
                     () -> "stage: " + client.stage + ", chunks: " + client.chunks);
 
             client.move(new Pos(0, 0, 0), 7, PlayerAuthInputData.START_FLYING);
-            assertTrue(tickUntil(() -> client.stage.contains(
-                    "Unsupported Bedrock movement capability")));
+            for (int attempt = 0; attempt < 20; attempt++) {
+                tick();
+                Thread.sleep(10);
+            }
+            assertFalse(player.isFlying());
+            assertTrue(client.disconnects.isEmpty());
         }
     }
 
@@ -366,11 +497,11 @@ public class BedrockLoginHandshakeTest {
              var visible = new LoginClient(
                      server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             visible.begin();
-            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            assertLoginCompletes(visible);
             Player visiblePlayer = awaitPlayer("Visible");
 
             assertTrue(tickUntil(() -> observer.playerLists.stream()
@@ -392,11 +523,11 @@ public class BedrockLoginHandshakeTest {
              var visible = new LoginClient(
                      server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             visible.begin();
-            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            assertLoginCompletes(visible);
             Player visiblePlayer = awaitPlayer("Visible");
 
             assertTrue(tickUntil(() -> observer.playerLists.stream()
@@ -404,7 +535,8 @@ public class BedrockLoginHandshakeTest {
                     .flatMap(packet -> packet.getEntries().stream())
                     .filter(entry -> entry.getUuid().equals(visiblePlayer.getUuid()))
                     .map(PlayerListPacket.Entry::getSkin)
-                    .anyMatch(skin -> skin.getSkinId().equals("test-classic")
+                    .anyMatch(skin -> skin.isValid()
+                            && skin.getSkinId().equals("test-classic")
                             && skin.getSkinData().getWidth() == 64
                             && skin.getSkinData().getHeight() == 64
                             && Arrays.equals(
@@ -418,7 +550,7 @@ public class BedrockLoginHandshakeTest {
         try (var observer = new LoginClient(
                 server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             final UUID javaUuid = UUID.randomUUID();
@@ -461,11 +593,11 @@ public class BedrockLoginHandshakeTest {
              var mover = new LoginClient(
                      server.boundAddress(), "Mover", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             mover.begin();
-            assertTrue(mover.completed.await(3, TimeUnit.SECONDS), () -> mover.stage);
+            assertLoginCompletes(mover);
             Player moverPlayer = awaitPlayer("Mover");
             mover.move(moverPlayer.getPosition(), 1, PlayerAuthInputData.HANDLE_TELEPORT);
             assertTrue(tickUntil(() ->
@@ -487,11 +619,11 @@ public class BedrockLoginHandshakeTest {
              var visible = new LoginClient(
                      server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             visible.begin();
-            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            assertLoginCompletes(visible);
             Player visiblePlayer = awaitPlayer("Visible");
             observer.entityData.clear();
 
@@ -513,11 +645,11 @@ public class BedrockLoginHandshakeTest {
              var visible = new LoginClient(
                      server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             visible.begin();
-            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            assertLoginCompletes(visible);
             Player visiblePlayer = awaitPlayer("Visible");
             assertTrue(tickUntil(() -> observer.addedPlayers.stream()
                     .anyMatch(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId())));
@@ -542,11 +674,11 @@ public class BedrockLoginHandshakeTest {
              var visible = new LoginClient(
                      server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             visible.begin();
-            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            assertLoginCompletes(visible);
             Player visiblePlayer = awaitPlayer("Visible");
             assertTrue(tickUntil(() -> observer.addedPlayers.stream()
                     .anyMatch(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId())));
@@ -570,7 +702,7 @@ public class BedrockLoginHandshakeTest {
         try (var observer = new LoginClient(
                 server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
             observer.addedEntities.clear();
             observer.addedPlayers.clear();
@@ -610,11 +742,11 @@ public class BedrockLoginHandshakeTest {
              var client = new LoginClient(
                      server.boundAddress(), "Chatter", AuthType.SELF_SIGNED, Credentials.VALID)) {
             observer.begin();
-            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            assertLoginCompletes(observer);
             awaitPlayer("Observer");
 
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer("Chatter");
             client.texts.clear();
             observer.texts.clear();
@@ -642,14 +774,16 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Latency", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
 
             tick();
 
             final NetworkStackLatencyPacket latency = client.latencies.poll(3, TimeUnit.SECONDS);
             assertNotNull(latency);
-            assertEquals(player.getLastKeepAlive(), latency.getTimestamp());
+            assertEquals(
+                    TimeUnit.NANOSECONDS.toMillis(player.getLastKeepAlive()),
+                    latency.getTimestamp());
             assertTrue(tickUntil(player::didAnswerKeepAlive));
             assertTrue(player.getLatency() >= 0);
         }
@@ -660,7 +794,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "TimedOut", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
 
             player.refreshKeepAlive(System.nanoTime() - TimeUnit.SECONDS.toNanos(16));
@@ -678,7 +812,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Kicked", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
             final PlayerConnection connection = player.getPlayerConnection();
 
@@ -699,7 +833,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Disconnected", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
 
             player.getPlayerConnection().disconnect();
@@ -714,7 +848,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Translations", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
 
             player.sendMessage(Component.text("translated"));
@@ -738,7 +872,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Shutdown", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
             final PlayerConnection connection = player.getPlayerConnection();
 
@@ -759,7 +893,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "Transfer", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             final Player player = awaitPlayer();
 
             player.getPlayerConnection().transfer("target.example", 19133);
@@ -835,7 +969,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "InboundLimit", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             awaitPlayer();
 
             for (int tick = 1; tick <= 17; tick++) {
@@ -862,7 +996,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "BatchLimit", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             awaitPlayer();
 
             for (int index = 0; index < 500; index++) {
@@ -911,7 +1045,7 @@ public class BedrockLoginHandshakeTest {
                             AuthType.SELF_SIGNED,
                             Credentials.VALID)) {
                         admitted.begin();
-                        assertTrue(admitted.completed.await(3, TimeUnit.SECONDS), () -> admitted.stage);
+                        assertLoginCompletes(admitted);
                         awaitPlayer();
                         for (int tick = 1; tick <= 32; tick++) {
                             admitted.move(new Pos(0, 42, 0), tick);
@@ -935,7 +1069,7 @@ public class BedrockLoginHandshakeTest {
         try (var client = new LoginClient(
                 server.boundAddress(), "ConcurrentClose", AuthType.SELF_SIGNED, Credentials.VALID)) {
             client.begin();
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             awaitPlayer();
 
             final CompletableFuture<Void> clientClose =
@@ -967,7 +1101,7 @@ public class BedrockLoginHandshakeTest {
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, credentials)) {
             client.begin();
 
-            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertLoginCompletes(client);
             assertEquals("disconnected: Invalid Bedrock login", client.stage);
         }
     }
@@ -990,6 +1124,10 @@ public class BedrockLoginHandshakeTest {
                 .filter(player -> player.getUsername().equals(name))
                 .findFirst()
                 .orElseThrow();
+    }
+
+    private void assertLoginCompletes(LoginClient client) throws InterruptedException {
+        assertTrue(tickUntil(() -> client.completed.getCount() == 0), () -> client.stage);
     }
 
     private boolean tickUntil(BooleanSupplier condition) throws InterruptedException {
@@ -1071,6 +1209,8 @@ public class BedrockLoginHandshakeTest {
 
     private enum Credentials {
         VALID,
+        VALID_CAPE,
+        VALID_GEOMETRY,
         EXPIRED_IDENTITY,
         INVALID_IDENTITY_SIGNATURE,
         INVALID_CLIENT_SIGNATURE,
@@ -1104,6 +1244,7 @@ public class BedrockLoginHandshakeTest {
         private final String clientJwt;
         private final String name;
         private final Credentials credentials;
+        private final BedrockCodec codec;
 
         private final BedrockClientSession session;
         private final Channel channel;
@@ -1114,6 +1255,9 @@ public class BedrockLoginHandshakeTest {
         private volatile boolean resourcePacksInfoEmpty;
         private volatile boolean resourcePackStackEmpty;
         private volatile boolean startGameReceived;
+        private volatile boolean loginSuccessReceived;
+        private volatile Vector3f startGamePosition;
+        private volatile GameType startGameType;
         private final BlockingQueue<ChunkSnapshot> chunks = new LinkedBlockingQueue<>();
         private final BlockingQueue<UpdateBlockPacket> blockUpdates = new LinkedBlockingQueue<>();
         private final BlockingQueue<MovePlayerPacket> moves = new LinkedBlockingQueue<>();
@@ -1127,13 +1271,25 @@ public class BedrockLoginHandshakeTest {
         private final BlockingQueue<TextPacket> texts = new LinkedBlockingQueue<>();
         private final BlockingQueue<NetworkStackLatencyPacket> latencies = new LinkedBlockingQueue<>();
         private final BlockingQueue<TransferPacket> transfers = new LinkedBlockingQueue<>();
+        private final BlockingQueue<UpdateAbilitiesPacket> abilities = new LinkedBlockingQueue<>();
         private final BlockingQueue<String> disconnects = new LinkedBlockingQueue<>();
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
                 throws Exception {
+            this(address, name, authType, credentials, Bedrock_v1001.CODEC);
+        }
+
+        private LoginClient(
+                InetSocketAddress address,
+                String name,
+                AuthType authType,
+                Credentials credentials,
+                BedrockCodec codec)
+                throws Exception {
             this.name = name;
             this.credentials = credentials;
+            this.codec = codec;
             String publicKey = Base64.getEncoder().encodeToString(identityKey.getPublic().getEncoded());
             JwtClaims identityClaims = new JwtClaims();
             identityClaims.setIssuedAtToNow();
@@ -1167,15 +1323,32 @@ public class BedrockLoginHandshakeTest {
                             skinSize == 64 ? CLASSIC_SKIN : classicSkin(skinSize, skinSize)));
             clientClaims.setClaim("PersonaSkin", credentials == Credentials.PERSONA_SKIN);
             clientClaims.setClaim("ArmSize", "wide");
-            if (credentials == Credentials.OVERSIZED_CAPE) {
+            if (credentials == Credentials.VALID_CAPE
+                    || credentials == Credentials.OVERSIZED_CAPE) {
+                clientClaims.setClaim("CapeImageWidth", 64);
+                clientClaims.setClaim("CapeImageHeight", 32);
                 clientClaims.setClaim(
                         "CapeData",
-                        Base64.getEncoder().encodeToString(new byte[32]));
+                        Base64.getEncoder().encodeToString(
+                                credentials == Credentials.VALID_CAPE
+                                        ? classicSkin(64, 32)
+                                        : new byte[32]));
             }
-            if (credentials == Credentials.OVERSIZED_GEOMETRY) {
+            if (credentials == Credentials.VALID_GEOMETRY
+                    || credentials == Credentials.OVERSIZED_GEOMETRY) {
                 clientClaims.setClaim(
                         "SkinGeometryData",
-                        Base64.getEncoder().encodeToString(new byte[32]));
+                        Base64.getEncoder().encodeToString(
+                                credentials == Credentials.VALID_GEOMETRY
+                                        ? "{\"format_version\":\"1.12.0\",\"minecraft:geometry\":[]}"
+                                                .getBytes(StandardCharsets.UTF_8)
+                                        : new byte[32]));
+                clientClaims.setClaim("SkinGeometryDataEngineVersion", "1.12.0");
+                clientClaims.setClaim(
+                        "SkinResourcePatch",
+                        Base64.getEncoder().encodeToString(
+                                "{\"geometry\":{\"default\":\"geometry.humanoid.custom\"}}"
+                                        .getBytes(StandardCharsets.UTF_8)));
             }
             clientJwt = sign(
                     clientClaims,
@@ -1188,11 +1361,11 @@ public class BedrockLoginHandshakeTest {
             channel = new Bootstrap()
                     .group(eventLoopGroup)
                     .channelFactory(RakChannelFactory.client(NioDatagramChannel.class))
-                    .option(RakChannelOption.RAK_PROTOCOL_VERSION, Bedrock_v1001.CODEC.getRaknetProtocolVersion())
+                    .option(RakChannelOption.RAK_PROTOCOL_VERSION, codec.getRaknetProtocolVersion())
                     .handler(new BedrockClientInitializer() {
                         @Override
                         protected void initSession(BedrockClientSession session) {
-                            session.setCodec(Bedrock_v1001.CODEC);
+                            session.setCodec(codec);
                             session.getPeer()
                                     .getChannel()
                                     .pipeline()
@@ -1250,7 +1423,7 @@ public class BedrockLoginHandshakeTest {
 
         private void begin() {
             var request = new RequestNetworkSettingsPacket();
-            request.setProtocolVersion(1001);
+            request.setProtocolVersion(codec.getProtocolVersion());
             session.sendPacketImmediately(request);
         }
 
@@ -1260,13 +1433,75 @@ public class BedrockLoginHandshakeTest {
 
         private void move(
                 Pos position, long tick, PlayerAuthInputData... additionalInputData) {
+            move(position, tick, ClientPlayMode.NORMAL, additionalInputData);
+        }
+
+        private void move(
+                Pos position,
+                long tick,
+                ClientPlayMode playMode,
+                PlayerAuthInputData... additionalInputData) {
+            session.sendPacket(movementPacket(position, tick, playMode, additionalInputData));
+        }
+
+        private void interactWithBlock(
+                Pos position,
+                long tick,
+                Vector3i blockPosition,
+                int blockStateId) {
+            final PlayerAuthInputPacket packet = movementPacket(
+                    position,
+                    tick,
+                    ClientPlayMode.NORMAL,
+                    PlayerAuthInputData.PERFORM_ITEM_INTERACTION);
+            final ItemUseTransaction transaction = new ItemUseTransaction();
+            transaction.setLegacyRequestId(0);
+            transaction.setUsingNetIds(false);
+            transaction.setActionType(0);
+            transaction.setTriggerType(ItemUseTransaction.TriggerType.PLAYER_INPUT);
+            transaction.setBlockPosition(blockPosition);
+            transaction.setBlockFace(1);
+            transaction.setHotbarSlot(0);
+            transaction.setItemInHand(ItemData.AIR);
+            transaction.setPlayerPosition(Vector3f.from(
+                    position.x(), position.y() + BedrockStartGame.PLAYER_EYE_HEIGHT, position.z()));
+            transaction.setClickPosition(Vector3f.from(0.5, 0.5, 0.5));
+            transaction.setBlockDefinition(
+                    blockDefinitions().getDefinition(blockStateId));
+            transaction.setClientInteractPrediction(ItemUseTransaction.PredictedResult.SUCCESS);
+            transaction.setClientCooldownState(0);
+            packet.setItemUseTransaction(transaction);
+            session.sendPacket(packet);
+        }
+
+        private void breakBlock(Pos position, long tick, Vector3i blockPosition) {
+            final PlayerAuthInputPacket packet = movementPacket(
+                    position,
+                    tick,
+                    ClientPlayMode.NORMAL,
+                    PlayerAuthInputData.PERFORM_BLOCK_ACTIONS);
+            final PlayerBlockActionData action = new PlayerBlockActionData();
+            action.setAction(PlayerActionType.START_BREAK);
+            action.setBlockPosition(blockPosition);
+            action.setFace(1);
+            packet.getPlayerActions().add(action);
+            session.sendPacket(packet);
+        }
+
+        private static PlayerAuthInputPacket movementPacket(
+                Pos position,
+                long tick,
+                ClientPlayMode playMode,
+                PlayerAuthInputData... additionalInputData) {
             var packet = new PlayerAuthInputPacket();
             packet.setRotation(Vector3f.from(position.pitch(), position.yaw(), position.yaw()));
             packet.setPosition(Vector3f.from(
-                    position.x(), position.y() + 1.62, position.z()));
+                    position.x(),
+                    position.y() + BedrockStartGame.PLAYER_EYE_HEIGHT,
+                    position.z()));
             packet.setMotion(Vector2f.ZERO);
             packet.setInputMode(InputMode.MOUSE);
-            packet.setPlayMode(ClientPlayMode.NORMAL);
+            packet.setPlayMode(playMode);
             packet.setTick(tick);
             packet.setDelta(Vector3f.ZERO);
             packet.setInputInteractionModel(InputInteractionModel.CLASSIC);
@@ -1277,7 +1512,7 @@ public class BedrockLoginHandshakeTest {
             packet.setRawMoveVector(Vector2f.ZERO);
             packet.getInputData().add(PlayerAuthInputData.VERTICAL_COLLISION);
             packet.getInputData().addAll(List.of(additionalInputData));
-            session.sendPacket(packet);
+            return packet;
         }
 
         private void sendText(String message) {
@@ -1331,7 +1566,7 @@ public class BedrockLoginHandshakeTest {
                 session.setCompression(packet.getCompressionAlgorithm());
                 if (!sendLogin) return PacketSignal.HANDLED;
                 var login = new LoginPacket();
-                login.setProtocolVersion(1001);
+                login.setProtocolVersion(codec.getProtocolVersion());
                 login.setAuthPayload(new CertificateChainPayload(List.of(identityJwt), authType));
                 login.setClientJwt(clientJwt);
                 session.sendPacketImmediately(login);
@@ -1362,6 +1597,9 @@ public class BedrockLoginHandshakeTest {
             public PacketSignal handle(PlayStatusPacket packet) {
                 stage = "received play status";
                 playStatus = packet.getStatus();
+                if (packet.getStatus() == PlayStatusPacket.Status.LOGIN_SUCCESS) {
+                    loginSuccessReceived = true;
+                }
                 return PacketSignal.HANDLED;
             }
 
@@ -1393,6 +1631,8 @@ public class BedrockLoginHandshakeTest {
             @Override
             public PacketSignal handle(StartGamePacket packet) {
                 stage = "received start game";
+                startGamePosition = packet.getPlayerPosition();
+                startGameType = packet.getPlayerGameType();
                 final String expectedServerEngine =
                         "Minestom/" + BedrockCompatibility.JAVA_VERSION
                                 + " BedrockMappings/" + BedrockCompatibility.BEDROCK_MAPPING_VERSION;
@@ -1487,7 +1727,8 @@ public class BedrockLoginHandshakeTest {
             public PacketSignal handle(NetworkStackLatencyPacket packet) {
                 latencies.add(packet.clone());
                 final NetworkStackLatencyPacket response = packet.clone();
-                response.setFromServer(false);
+                response.setTimestamp(
+                        TimeUnit.MILLISECONDS.toNanos(packet.getTimestamp()));
                 session.sendPacketImmediately(response);
                 return PacketSignal.HANDLED;
             }
@@ -1495,6 +1736,12 @@ public class BedrockLoginHandshakeTest {
             @Override
             public PacketSignal handle(TransferPacket packet) {
                 transfers.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(UpdateAbilitiesPacket packet) {
+                abilities.add(packet.clone());
                 return PacketSignal.HANDLED;
             }
 

@@ -173,8 +173,8 @@ final class BedrockChunkCodec {
                 }
                 output.writeIntLE(word);
             }
+            VarInts.writeInt(output, palette.size());
         }
-        VarInts.writeInt(output, palette.size());
         palette.forEach(runtimeId -> VarInts.writeInt(output, runtimeId));
     }
 
