@@ -15,6 +15,7 @@ import org.cloudburstmc.protocol.bedrock.BedrockClientSession;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.codec.v1001.Bedrock_v1001;
 import org.cloudburstmc.protocol.bedrock.codec.v2168.Bedrock_v2168;
+import org.cloudburstmc.protocol.bedrock.codec.v2169.Bedrock_v2169;
 import org.cloudburstmc.protocol.bedrock.codec.v924.Bedrock_v924;
 import org.cloudburstmc.protocol.bedrock.codec.v944.Bedrock_v944;
 import org.cloudburstmc.protocol.bedrock.codec.v975.Bedrock_v975;
@@ -79,7 +80,8 @@ public class BedrockProtocolNegotiationTest {
                 Arguments.of(Bedrock_v944.CODEC),
                 Arguments.of(Bedrock_v975.CODEC),
                 Arguments.of(Bedrock_v1001.CODEC),
-                Arguments.of(Bedrock_v2168.CODEC));
+                Arguments.of(Bedrock_v2168.CODEC),
+                Arguments.of(Bedrock_v2169.CODEC));
     }
 
     @Test
@@ -88,7 +90,7 @@ public class BedrockProtocolNegotiationTest {
             client.requestNetworkSettings(685);
 
             assertTrue(client.disconnected.await(2, TimeUnit.SECONDS));
-            assertEquals("Unsupported Bedrock protocol 685; expected one of 924, 944, 975, 1001, 2168",
+            assertEquals("Unsupported Bedrock protocol 685; expected one of 924, 944, 975, 1001, 2168, 2169",
                     client.disconnectReason.toString());
         }
     }

@@ -3,6 +3,7 @@ package net.minestom.server.bedrock;
 import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
 import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
@@ -23,10 +24,25 @@ final class BedrockSkin {
         this.source = Objects.requireNonNull(source, "source");
     }
 
-    static BedrockSkin classic(Map<String, Object> clientData) {
+    static BedrockSkin classic(
+            Map<String, Object> clientData,
+            BedrockServerLimits limits) {
+        Objects.requireNonNull(limits, "limits");
         if (requiredBoolean(clientData, "PersonaSkin")) {
             throw new IllegalArgumentException("Persona skins are not supported");
         }
+        rejectUnsupportedBase64(
+                clientData, "CapeData", limits.maxCapeBytes(), "Cape data");
+        rejectUnsupportedBase64(
+                clientData,
+                "SkinGeometryData",
+                limits.maxGeometryBytes(),
+                "Skin geometry data");
+        rejectUnsupportedText(
+                clientData,
+                "SkinGeometryDataEngineVersion",
+                limits.maxGeometryBytes(),
+                "Skin geometry engine version");
         final int width = requiredDimension(clientData, "SkinImageWidth");
         final int height = requiredDimension(clientData, "SkinImageHeight");
         if (width != WIDTH || (height != 32 && height != MAX_HEIGHT)) {
@@ -131,6 +147,50 @@ final class BedrockSkin {
             throw new IllegalArgumentException("Client data is missing " + key);
         }
         return result;
+    }
+
+    private static void rejectUnsupportedBase64(
+            Map<String, Object> values,
+            String key,
+            int maximumBytes,
+            String label) {
+        final Object value = values.get(key);
+        if (value == null) return;
+        if (!(value instanceof String encoded)) {
+            throw new IllegalArgumentException(label + " is not a string");
+        }
+        if (encoded.isEmpty()) return;
+        final long maximumEncodedBytes = ((long) maximumBytes + 2) / 3 * 4;
+        if (encoded.length() > maximumEncodedBytes) {
+            throw new IllegalArgumentException(label + " exceeds the login limit");
+        }
+        final byte[] decoded;
+        try {
+            decoded = Base64.getDecoder().decode(encoded);
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalArgumentException(label + " is not valid base64", exception);
+        }
+        if (decoded.length > maximumBytes) {
+            throw new IllegalArgumentException(label + " exceeds the login limit");
+        }
+        throw new IllegalArgumentException(label + " is not supported");
+    }
+
+    private static void rejectUnsupportedText(
+            Map<String, Object> values,
+            String key,
+            int maximumBytes,
+            String label) {
+        final Object value = values.get(key);
+        if (value == null) return;
+        if (!(value instanceof String text)) {
+            throw new IllegalArgumentException(label + " is not a string");
+        }
+        if (text.isEmpty()) return;
+        if (text.getBytes(StandardCharsets.UTF_8).length > maximumBytes) {
+            throw new IllegalArgumentException(label + " exceeds the login limit");
+        }
+        throw new IllegalArgumentException(label + " is not supported");
     }
 
     enum Source {

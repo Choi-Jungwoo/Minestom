@@ -4,8 +4,33 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
 
 final class BedrockMaintenanceTool {
+    private static final Set<String> REQUIRED_COMPATIBILITY_PINS = Set.of(
+            "java.version",
+            "bedrock.mapping.version",
+            "bedrock.wire.version",
+            "cloudburst.connection",
+            "cloudburst.common",
+            "cloudburst.codec",
+            "cloudburst.raknet",
+            "netty",
+            "mappings.version",
+            "mappings.source",
+            "mappings.commit",
+            "mappings.sha256",
+            "mappings.runtime-palette.source",
+            "mappings.runtime-palette.commit",
+            "mappings.runtime-palette.sha256",
+            "protocols.primary",
+            "protocols.accepted",
+            "protocols.supported");
+
     private BedrockMaintenanceTool() {
     }
 
@@ -24,6 +49,15 @@ final class BedrockMaintenanceTool {
                     mappings.sha256());
             return;
         }
+        if (arguments.length == 3 && arguments[0].equals("update")) {
+            final Path source = Path.of(arguments[1]);
+            final Path destination = Path.of(arguments[2]);
+            updateCompatibilityPins(source, destination);
+            System.out.printf(
+                    "Installed reviewed Bedrock compatibility pins from %s%n",
+                    source.toAbsolutePath().normalize());
+            return;
+        }
         if (arguments.length == 3 && arguments[0].equals("prepare")) {
             final Path destination = Path.of(arguments[2]);
             prepare(Path.of(arguments[1]), destination, BedrockMappings.SUPPORTED_RELEASE);
@@ -34,6 +68,7 @@ final class BedrockMaintenanceTool {
         }
         throw new IllegalArgumentException(
                 "Usage: BedrockMaintenanceTool report | verify <directory>"
+                        + " | update <source-file> <destination-file>"
                         + " | prepare <source-directory> <destination-directory>");
     }
 
@@ -64,6 +99,54 @@ final class BedrockMaintenanceTool {
                 BedrockCompatibility.RUNTIME_PALETTE_SHA256,
                 BedrockCompatibility.ACCEPTED_PROTOCOLS,
                 BedrockCompatibility.SUPPORTED_PROTOCOLS);
+    }
+
+    static void updateCompatibilityPins(Path sourceFile, Path destinationFile) throws IOException {
+        final Path source = sourceFile.toAbsolutePath().normalize();
+        final Path destination = destinationFile.toAbsolutePath().normalize();
+        if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException(
+                    "Bedrock compatibility manifest is not a regular file: " + source);
+        }
+
+        final Properties pins = new Properties();
+        try (var input = Files.newInputStream(source)) {
+            pins.load(input);
+        }
+        if (!pins.stringPropertyNames().containsAll(REQUIRED_COMPATIBILITY_PINS)) {
+            throw new IllegalArgumentException(
+                    "Compatibility manifest must contain: "
+                            + REQUIRED_COMPATIBILITY_PINS.stream().sorted().toList());
+        }
+        for (String name : Set.of(
+                "cloudburst.connection",
+                "cloudburst.common",
+                "cloudburst.codec",
+                "cloudburst.raknet",
+                "netty")) {
+            final String version = pins.getProperty(name);
+            if (version.toLowerCase(Locale.ROOT).contains("snapshot")
+                    || version.equalsIgnoreCase("latest")) {
+                throw new IllegalArgumentException(
+                        name + " must be pinned to an immutable version");
+            }
+        }
+        for (Map.Entry<String, Integer> pin : Map.of(
+                "mappings.commit", 40,
+                "mappings.runtime-palette.commit", 40,
+                "mappings.sha256", 64,
+                "mappings.runtime-palette.sha256", 64).entrySet()) {
+            final String value = pins.getProperty(pin.getKey());
+            if (value.length() != pin.getValue()
+                    || value.chars().anyMatch(character ->
+                    !Character.isDigit(character) && (character < 'a' || character > 'f'))) {
+                throw new IllegalArgumentException(
+                        pin.getKey() + " must be a lowercase hexadecimal pin");
+            }
+        }
+        if (!source.equals(destination)) {
+            Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     static void prepare(

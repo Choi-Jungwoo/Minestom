@@ -18,6 +18,7 @@ import java.util.zip.GZIPOutputStream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 public class BedrockMappingsTest {
     @TempDir
@@ -59,6 +60,37 @@ public class BedrockMappingsTest {
         assertEquals(1, mappings.blockStateCount());
         assertEquals(1, mappings.itemCount());
         assertEquals(1, mappings.biomeCount());
+    }
+
+    @Test
+    void installsOnlyReviewedImmutableCompatibilityPins() throws IOException {
+        var source = directory.resolve("reviewed.properties");
+        var destination = directory.resolve("installed.properties");
+        try (var input = BedrockCompatibility.class.getResourceAsStream(
+                "/META-INF/minestom-bedrock.properties")) {
+            Files.copy(input, source);
+        }
+
+        BedrockMaintenanceTool.main(new String[]{
+                "update",
+                source.toString(),
+                destination.toString(),
+        });
+
+        assertArrayEquals(Files.readAllBytes(source), Files.readAllBytes(destination));
+
+        Files.writeString(
+                source,
+                Files.readString(source).replace(
+                        "netty=4.2.17.Final",
+                        "netty=latest"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> BedrockMaintenanceTool.main(new String[]{
+                        "update",
+                        source.toString(),
+                        destination.toString(),
+                }));
     }
 
     @Test

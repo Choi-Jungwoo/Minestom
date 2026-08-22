@@ -16,11 +16,16 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockDiscoveryTest {
@@ -65,6 +70,43 @@ public class BedrockDiscoveryTest {
         assertEquals(3, pong.playerCount());
         assertEquals(20, pong.maximumPlayerCount());
         assertEquals(server.boundAddress().getPort(), pong.ipv4Port());
+    }
+
+    @Test
+    void discoveryUsesConfiguredGuidVersionPolicyAndBedrockAdvertisement() throws Exception {
+        process = MinecraftServer.updateProcess();
+        final var config = new BedrockServerConfig(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                process.instance().createInstanceContainer(),
+                Path.of("."),
+                42,
+                BedrockServerLimits.defaults(),
+                new BedrockVersionPolicy(1001, List.of(1001), Set.of(1001)),
+                new BedrockAdvertisement("Custom", "Secondary", "Creative", true));
+        server = BedrockServer.createForTesting(process, config);
+        server.start();
+
+        final BedrockPong pong = discover(server.boundAddress());
+
+        assertEquals(42, pong.serverId());
+        assertEquals(1001, pong.protocolVersion());
+        assertEquals("Custom", pong.edition());
+        assertEquals("Secondary", pong.subMotd());
+        assertEquals("Creative", pong.gameType());
+        assertTrue(pong.nintendoLimited());
+    }
+
+    @Test
+    void cancelledStatusEventSuppressesTheDiscoveryResponse() {
+        process = MinecraftServer.updateProcess();
+        process.eventHandler().addListener(
+                ServerListPingEvent.class,
+                event -> event.setCancelled(true));
+        server = BedrockServer.createForTesting(
+                process, new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        server.start();
+
+        assertThrows(SocketTimeoutException.class, () -> discover(server.boundAddress()));
     }
 
     @Test

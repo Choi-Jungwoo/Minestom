@@ -45,7 +45,7 @@ public class BedrockCompatibilityTest {
                 BedrockCompatibility.RUNTIME_PALETTE_SHA256);
         assertEquals(BedrockCompatibility.RUNTIME_PALETTE_SHA256,
                 properties.getProperty("mappings.runtime-palette.sha256"));
-        assertEquals("924,944,975,1001,2168", properties.getProperty("protocols.accepted"));
+        assertEquals("924,944,975,1001,2168,2169", properties.getProperty("protocols.accepted"));
         assertEquals("1001", properties.getProperty("protocols.supported"));
     }
 
@@ -53,7 +53,7 @@ public class BedrockCompatibilityTest {
     @Tag("bedrock-acceptance")
     void acceptedProtocolsDoNotOverstateAutomatedSupport() {
         assertEquals(
-                List.of(924, 944, 975, 1001, 2168),
+                List.of(924, 944, 975, 1001, 2168, 2169),
                 BedrockCompatibility.ACCEPTED_PROTOCOLS);
         assertEquals(Set.of(1001), BedrockCompatibility.SUPPORTED_PROTOCOLS);
         assertTrue(BedrockCompatibility.ACCEPTED_PROTOCOLS.containsAll(

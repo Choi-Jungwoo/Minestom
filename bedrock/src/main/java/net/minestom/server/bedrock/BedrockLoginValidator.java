@@ -67,7 +67,7 @@ final class BedrockLoginValidator {
         if (!gameVersion.startsWith("1.26.")) {
             throw new IllegalArgumentException("Client data is not for Bedrock 1.26");
         }
-        final BedrockSkin skin = BedrockSkin.classic(clientData);
+        final BedrockSkin skin = BedrockSkin.classic(clientData, limits);
         return new VerifiedLogin(clientKey, name, skin);
     }
 

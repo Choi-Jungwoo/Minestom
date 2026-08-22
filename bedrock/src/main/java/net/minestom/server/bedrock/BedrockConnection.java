@@ -21,23 +21,49 @@ import net.minestom.server.network.packet.client.play.ClientChatMessagePacket;
 import net.minestom.server.network.packet.client.play.ClientCommandChatPacket;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
 import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
+import net.minestom.server.network.packet.server.BufferedPacket;
 import net.minestom.server.network.packet.server.CachedPacket;
+import net.minestom.server.network.packet.server.FramedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.packet.server.common.KeepAlivePacket;
 import net.minestom.server.network.packet.server.play.BlockChangePacket;
+import net.minestom.server.network.packet.server.play.ChangeGameStatePacket;
+import net.minestom.server.network.packet.server.play.ChunkBatchFinishedPacket;
+import net.minestom.server.network.packet.server.play.ChunkBatchStartPacket;
+import net.minestom.server.network.packet.server.play.DeclareCommandsPacket;
+import net.minestom.server.network.packet.server.play.DeclareRecipesPacket;
 import net.minestom.server.network.packet.server.play.DestroyEntitiesPacket;
+import net.minestom.server.network.packet.server.play.EntityAttributesPacket;
 import net.minestom.server.network.packet.server.play.EntityEquipmentPacket;
+import net.minestom.server.network.packet.server.play.EntityHeadLookPacket;
 import net.minestom.server.network.packet.server.play.EntityMetaDataPacket;
 import net.minestom.server.network.packet.server.play.EntityPositionAndRotationPacket;
 import net.minestom.server.network.packet.server.play.EntityPositionPacket;
+import net.minestom.server.network.packet.server.play.EntityPositionSyncPacket;
+import net.minestom.server.network.packet.server.play.EntityStatusPacket;
+import net.minestom.server.network.packet.server.play.EntityVelocityPacket;
+import net.minestom.server.network.packet.server.play.HeldItemChangePacket;
+import net.minestom.server.network.packet.server.play.InitializeWorldBorderPacket;
+import net.minestom.server.network.packet.server.play.JoinGamePacket;
 import net.minestom.server.network.packet.server.play.MultiBlockChangePacket;
+import net.minestom.server.network.packet.server.play.PlayerAbilitiesPacket;
 import net.minestom.server.network.packet.server.play.PlayerInfoRemovePacket;
 import net.minestom.server.network.packet.server.play.PlayerInfoUpdatePacket;
 import net.minestom.server.network.packet.server.play.PlayerPositionAndLookPacket;
+import net.minestom.server.network.packet.server.play.RecipeBookAddPacket;
+import net.minestom.server.network.packet.server.play.RecipeBookRemovePacket;
+import net.minestom.server.network.packet.server.play.RecipeBookSettingsPacket;
+import net.minestom.server.network.packet.server.play.ServerDifficultyPacket;
+import net.minestom.server.network.packet.server.play.SetPlayerInventorySlotPacket;
+import net.minestom.server.network.packet.server.play.SetTimePacket;
 import net.minestom.server.network.packet.server.play.SpawnEntityPacket;
+import net.minestom.server.network.packet.server.play.SpawnPositionPacket;
 import net.minestom.server.network.packet.server.play.SystemChatPacket;
+import net.minestom.server.network.packet.server.play.TeamsPacket;
 import net.minestom.server.network.packet.server.play.UnloadChunkPacket;
+import net.minestom.server.network.packet.server.play.UpdateHealthPacket;
 import net.minestom.server.network.packet.server.play.UpdateViewPositionPacket;
+import net.minestom.server.network.packet.server.play.WindowItemsPacket;
 import net.minestom.server.network.player.PlayerConnection;
 import net.minestom.server.utils.position.PositionUtils;
 import net.minestom.server.world.DimensionType;
@@ -104,6 +130,33 @@ public final class BedrockConnection extends PlayerConnection {
             Component.text("Unsupported Bedrock instance data");
     private static final Component UNSUPPORTED_MOVEMENT =
             Component.text("Unsupported Bedrock movement capability");
+    private static final Component UNSUPPORTED_CRITICAL_PACKET =
+            Component.text("Unsupported critical Bedrock packet");
+    private static final Set<Class<?>> INTENTIONALLY_IGNORED_PACKETS = Set.of(
+            ChangeGameStatePacket.class,
+            ChunkBatchFinishedPacket.class,
+            ChunkBatchStartPacket.class,
+            DeclareCommandsPacket.class,
+            DeclareRecipesPacket.class,
+            EntityAttributesPacket.class,
+            EntityHeadLookPacket.class,
+            EntityStatusPacket.class,
+            EntityVelocityPacket.class,
+            HeldItemChangePacket.class,
+            InitializeWorldBorderPacket.class,
+            JoinGamePacket.class,
+            PlayerAbilitiesPacket.class,
+            RecipeBookAddPacket.class,
+            RecipeBookRemovePacket.class,
+            RecipeBookSettingsPacket.class,
+            ServerDifficultyPacket.class,
+            SetPlayerInventorySlotPacket.class,
+            SetTimePacket.class,
+            SpawnEntityPacket.class,
+            SpawnPositionPacket.class,
+            TeamsPacket.class,
+            UpdateHealthPacket.class,
+            WindowItemsPacket.class);
     private static final float TELEPORT_CONFIRM_TOLERANCE = 0.1f;
     private static final int TELEPORT_RESEND_INPUTS = 20;
     private static final Set<PlayerAuthInputData> UNSUPPORTED_MOVEMENT_INPUTS = EnumSet.of(
@@ -127,6 +180,7 @@ public final class BedrockConnection extends PlayerConnection {
     private final BedrockMappings mappings;
     private final ServerProcess process;
     private final BedrockSkin displaySkin;
+    private final BedrockDiagnostics diagnostics;
     private final Map<Integer, UUID> visiblePlayerUuids = new ConcurrentHashMap<>();
     private final AtomicBoolean disconnected = new AtomicBoolean();
     private final AtomicInteger pendingDimensionChanges = new AtomicInteger();
@@ -141,13 +195,15 @@ public final class BedrockConnection extends PlayerConnection {
             InetSocketAddress serverAddress,
             BedrockMappings mappings,
             ServerProcess process,
-            BedrockSkin displaySkin) {
+            BedrockSkin displaySkin,
+            BedrockDiagnostics diagnostics) {
         this.session = Objects.requireNonNull(session, "session");
         this.remoteAddress = Objects.requireNonNull(remoteAddress, "remoteAddress");
         this.serverAddress = Objects.requireNonNull(serverAddress, "serverAddress");
         this.mappings = Objects.requireNonNull(mappings, "mappings");
         this.process = Objects.requireNonNull(process, "process");
         this.displaySkin = Objects.requireNonNull(displaySkin, "displaySkin");
+        this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
     }
 
     static UUID offlineUuid(String name) {
@@ -163,42 +219,76 @@ public final class BedrockConnection extends PlayerConnection {
             sendPacket(cached.packet(ConnectionState.PLAY));
             return;
         }
+        if (packet instanceof FramedPacket framed) {
+            sendPacket(framed.packet());
+            return;
+        }
+        if (packet instanceof BufferedPacket) {
+            failUnsupportedPacket(packet);
+            return;
+        }
         try {
+            final TranslationOutcome outcome;
             if (packet instanceof KeepAlivePacket keepAlive) {
                 sendKeepAlive(keepAlive);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof BlockChangePacket change) {
                 sendBlockUpdate(
                         change.blockPosition().blockX(),
                         change.blockPosition().blockY(),
                         change.blockPosition().blockZ(),
                         change.blockStateId());
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof MultiBlockChangePacket changes) {
                 sendBlockUpdates(changes);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof UnloadChunkPacket unload) {
                 sendEmptyChunk(unload.chunkX(), unload.chunkZ());
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof UpdateViewPositionPacket view) {
                 sendChunkPublisherUpdate(view);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof PlayerPositionAndLookPacket position) {
                 sendPosition(position);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof SystemChatPacket chat) {
                 sendSystemChat(chat);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof PlayerInfoUpdatePacket playerInfo) {
                 sendPlayerInfo(playerInfo);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof PlayerInfoRemovePacket playerInfo) {
                 sendPlayerInfoRemoval(playerInfo);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof SpawnEntityPacket spawn
                     && spawn.type() == EntityType.PLAYER) {
                 sendPlayerSpawn(spawn);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof EntityPositionPacket position) {
                 sendPlayerPosition(position.entityId());
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof EntityPositionAndRotationPacket position) {
                 sendPlayerPosition(position.entityId());
+                outcome = TranslationOutcome.TRANSLATED;
+            } else if (packet instanceof EntityPositionSyncPacket position) {
+                sendPlayerPosition(position.entityId());
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof EntityMetaDataPacket metadata) {
                 sendPlayerMetadata(metadata.entityId());
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof DestroyEntitiesPacket removals) {
                 sendPlayerRemovals(removals);
+                outcome = TranslationOutcome.TRANSLATED;
             } else if (packet instanceof EntityEquipmentPacket equipment) {
                 sendPlayerEquipment(equipment);
+                outcome = TranslationOutcome.TRANSLATED;
+            } else if (INTENTIONALLY_IGNORED_PACKETS.contains(packet.getClass())) {
+                outcome = TranslationOutcome.INTENTIONALLY_IGNORED;
+            } else {
+                outcome = TranslationOutcome.UNSUPPORTED_CRITICAL;
+            }
+            if (outcome == TranslationOutcome.UNSUPPORTED_CRITICAL) {
+                failUnsupportedPacket(packet);
             }
         } catch (RuntimeException exception) {
             failInstanceData(exception);
@@ -735,6 +825,12 @@ public final class BedrockConnection extends PlayerConnection {
         }
     }
 
+    private enum TranslationOutcome {
+        TRANSLATED,
+        INTENTIONALLY_IGNORED,
+        UNSUPPORTED_CRITICAL
+    }
+
     private static void releasePayload(BedrockPacket packet) {
         if (packet instanceof LevelChunkPacket chunk && chunk.getData().refCnt() > 0) {
             chunk.getData().release();
@@ -744,6 +840,19 @@ public final class BedrockConnection extends PlayerConnection {
     private void failInstanceData(RuntimeException exception) {
         process.exception().handleException(exception);
         kick(UNSUPPORTED_INSTANCE_DATA);
+    }
+
+    private void failUnsupportedPacket(SendablePacket packet) {
+        final var exception = new UnsupportedOperationException(
+                "Missing Bedrock translator for " + packet.getClass().getSimpleName());
+        if (diagnostics.rejection(
+                session.getCodec().getProtocolVersion(),
+                "PLAY",
+                packet.getClass().getSimpleName(),
+                exception)) {
+            process.exception().handleException(exception);
+        }
+        kick(UNSUPPORTED_CRITICAL_PACKET);
     }
 
     private void disconnectOnce(Runnable notifyPeer) {

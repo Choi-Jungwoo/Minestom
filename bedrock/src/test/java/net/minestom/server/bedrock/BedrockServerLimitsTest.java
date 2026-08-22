@@ -1,16 +1,54 @@
 package net.minestom.server.bedrock;
 
+import net.minestom.server.MinecraftServer;
 import org.cloudburstmc.netty.channel.raknet.RakConstants;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Set;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockServerLimitsTest {
     @Test
-    void limitsDoNotChangeTheExistingConfigRecordShape() {
-        assertEquals(3, BedrockServerConfig.class.getRecordComponents().length);
+    void configOwnsListenerCompatibilityAndAdvertisementPolicy() {
+        final var address =
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 19132);
+        final var process = MinecraftServer.updateProcess();
+        try {
+            final var instance = process.instance().createInstanceContainer();
+            final var mappingsSource = Path.of("run/bedrock-mappings");
+            final var limits = BedrockServerLimits.defaults();
+            final var versions =
+                    new BedrockVersionPolicy(1001, List.of(1001, 2169), Set.of(1001));
+            final var advertisement =
+                    new BedrockAdvertisement("MCPE", "Configured", "Creative", true);
+
+            final var config = new BedrockServerConfig(
+                    address,
+                    instance,
+                    mappingsSource,
+                    42,
+                    limits,
+                    versions,
+                    advertisement);
+
+            assertEquals(address, config.address());
+            assertSame(instance, config.spawningInstance());
+            assertEquals(mappingsSource.toAbsolutePath(), config.mappingsSource());
+            assertEquals(42, config.rakNetGuid());
+            assertSame(limits, config.limits());
+            assertSame(versions, config.versionPolicy());
+            assertSame(advertisement, config.advertisement());
+        } finally {
+            process.stop();
+        }
     }
 
     @Test
@@ -25,6 +63,18 @@ public class BedrockServerLimitsTest {
         assertTrue(limits.maxDecompressedBatchBytes() > 0);
         assertTrue(limits.maxPacketsPerTick() > 0);
         assertTrue(limits.maxJwtBytes() > 0);
+        assertTrue(limits.maxCapeBytes() > 0);
+        assertTrue(limits.maxGeometryBytes() > 0);
+    }
+
+    @Test
+    void rejectsPromotingAnExperimentalCodecToSupported() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new BedrockVersionPolicy(
+                        2169,
+                        List.of(1001, 2169),
+                        Set.of(1001, 2169)));
     }
 
     @Test

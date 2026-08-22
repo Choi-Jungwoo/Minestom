@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("minestom.java-library")
 }
@@ -7,33 +9,72 @@ repositories {
     maven("https://repo.opencollab.dev/main")
 }
 
+val compatibilityManifest =
+    layout.projectDirectory.file("../gradle/bedrock-compatibility.properties")
+val compatibilityPins =
+    Properties().apply {
+        compatibilityManifest.asFile.inputStream().use(::load)
+    }
+
+fun compatibilityPin(name: String): String =
+    requireNotNull(compatibilityPins.getProperty(name)) {
+        "Missing Bedrock compatibility pin: $name"
+    }
+
 dependencies {
     api(project(":"))
 
     // Bedrock 1.26 is only available in timestamped Cloudburst 3.0 builds; these mirror Geyser's pins.
-    implementation(platform(libs.netty.bom))
-    implementation(libs.netty.codec)
-    implementation(libs.netty.handler)
-    implementation(libs.netty.transport)
-    implementation(libs.netty.transport.classes.epoll)
-    implementation(libs.netty.transport.classes.kqueue)
+    implementation(platform("io.netty:netty-bom:${compatibilityPin("netty")}"))
+    implementation("io.netty:netty-codec")
+    implementation("io.netty:netty-handler")
+    implementation("io.netty:netty-transport")
+    implementation("io.netty:netty-transport-classes-epoll")
+    implementation("io.netty:netty-transport-classes-kqueue")
     implementation(libs.gson)
 
-    implementation(libs.cloudburst.common) {
+    implementation(
+        "org.cloudburstmc.protocol:common:${compatibilityPin("cloudburst.common")}",
+    ) {
         exclude(group = "io.netty")
     }
-    implementation(libs.cloudburst.codec) {
+    implementation(
+        "org.cloudburstmc.protocol:bedrock-codec:${compatibilityPin("cloudburst.codec")}",
+    ) {
         exclude(group = "io.netty")
     }
-    implementation(libs.cloudburst.connection) {
+    implementation(
+        "org.cloudburstmc.protocol:bedrock-connection:${compatibilityPin("cloudburst.connection")}",
+    ) {
         exclude(group = "io.netty")
         exclude(group = "org.cloudburstmc.netty", module = "netty-transport-raknet")
     }
-    implementation(libs.cloudburst.raknet) {
+    implementation(
+        "org.cloudburstmc.netty:netty-transport-raknet:${compatibilityPin("cloudburst.raknet")}",
+    ) {
         exclude(group = "io.netty")
     }
 
     testImplementation(project(":testing"))
+    testRuntimeOnly(
+        "io.netty:netty-transport-native-epoll:${compatibilityPin("netty")}:linux-x86_64",
+    )
+    testRuntimeOnly(
+        "io.netty:netty-transport-native-epoll:${compatibilityPin("netty")}:linux-aarch_64",
+    )
+    testRuntimeOnly(
+        "io.netty:netty-transport-native-kqueue:${compatibilityPin("netty")}:osx-x86_64",
+    )
+    testRuntimeOnly(
+        "io.netty:netty-transport-native-kqueue:${compatibilityPin("netty")}:osx-aarch_64",
+    )
+}
+
+tasks.processResources {
+    from(compatibilityManifest) {
+        into("META-INF")
+        rename { "minestom-bedrock.properties" }
+    }
 }
 
 val acceptanceTest = tasks.register<Test>("acceptanceTest") {
@@ -53,6 +94,24 @@ tasks.check {
 
 val bedrockMappingsDirectory = providers.gradleProperty("bedrockMappingsDirectory")
 val bedrockMappingsSource = providers.gradleProperty("bedrockMappingsSource")
+val bedrockCompatibilityFile =
+    layout.projectDirectory.dir("..").file(
+        providers.gradleProperty("bedrockCompatibilityFile"),
+    )
+
+tasks.register<JavaExec>("updateCompatibilityPins") {
+    group = "build setup"
+    description = "Installs one reviewed immutable Bedrock compatibility manifest."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("net.minestom.server.bedrock.BedrockMaintenanceTool")
+    inputs.file(bedrockCompatibilityFile)
+    outputs.file(compatibilityManifest)
+    args(
+        "update",
+        bedrockCompatibilityFile.get().asFile.absolutePath,
+        compatibilityManifest.asFile.absolutePath,
+    )
+}
 
 tasks.register<JavaExec>("verifyMappings") {
     group = "verification"

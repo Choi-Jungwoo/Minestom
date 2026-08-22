@@ -27,7 +27,9 @@ import net.minestom.server.event.player.PlayerMoveEvent;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.item.ItemStack;
 import net.minestom.server.item.Material;
+import net.minestom.server.network.NetworkBuffer;
 import net.minestom.server.network.PlayerAdmission;
+import net.minestom.server.network.packet.server.BufferedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.player.GameProfile;
 import net.minestom.server.network.player.PlayerConnection;
@@ -169,6 +171,22 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    void resourcePackCompletionBeforeTheStackIsRejected() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(),
+                "PackOrder",
+                AuthType.SELF_SIGNED,
+                Credentials.INVALID_RESOURCE_PACK_ORDER)) {
+            client.begin();
+
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertEquals(
+                    "disconnected: Invalid Bedrock resource-pack handshake",
+                    client.stage);
+        }
+    }
+
+    @Test
     void validGuestLoginCompletesTheSameHandshake() throws Exception {
         try (var client =
                      new LoginClient(server.boundAddress(), "GuestPlayer", AuthType.GUEST, Credentials.VALID)) {
@@ -216,6 +234,11 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    void rejectsAnInvalidIdentitySignatureWithoutLeakingTheCause() throws Exception {
+        assertLoginRejected(Credentials.INVALID_IDENTITY_SIGNATURE);
+    }
+
+    @Test
     void rejectsClientDataSignedByAnotherKeyWithoutLeakingTheCause() throws Exception {
         assertLoginRejected(Credentials.INVALID_CLIENT_SIGNATURE);
     }
@@ -223,6 +246,25 @@ public class BedrockLoginHandshakeTest {
     @Test
     void rejectsClientDataThatDoesNotMatchTheIdentityWithoutLeakingTheCause() throws Exception {
         assertLoginRejected(Credentials.MISMATCHED_CLIENT_DATA);
+    }
+
+    @Test
+    void rejectsMalformedClientDataWithoutLeakingTheCause() throws Exception {
+        assertLoginRejected(Credentials.MALFORMED_CLIENT_DATA);
+    }
+
+    @Test
+    void rejectsAnOverlongBedrockNameWithoutTruncation() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(),
+                "SeventeenCharsLong",
+                AuthType.SELF_SIGNED,
+                Credentials.VALID)) {
+            client.begin();
+
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            assertEquals("disconnected: Invalid Bedrock login", client.stage);
+        }
     }
 
     @Test
@@ -668,6 +710,28 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    void outboundTranslationDistinguishesSuccessIgnoredAndCriticalPackets() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "Translations", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+
+            player.sendMessage(Component.text("translated"));
+            assertEquals("translated", client.texts.poll(3, TimeUnit.SECONDS).getMessage());
+
+            player.refreshCommands();
+            tick();
+            assertTrue(client.session.isConnected());
+
+            player.sendPacket(new BufferedPacket(NetworkBuffer.resizableBuffer(), 0, 0));
+            assertEquals(
+                    "Unsupported critical Bedrock packet",
+                    client.disconnects.poll(3, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void serverShutdownDisconnectsAndCleansAnAdmittedPlayerOnce() throws Exception {
         final AtomicInteger disconnectEvents = new AtomicInteger();
         process.eventHandler().addListener(PlayerDisconnectEvent.class, _ -> disconnectEvents.incrementAndGet());
@@ -719,6 +783,24 @@ public class BedrockLoginHandshakeTest {
                 256,
                 1_024));
         assertLoginRejected(Credentials.VALID);
+    }
+
+    @Test
+    void configuredCapeAndGeometryLimitsRejectOversizedLoginInputs() throws Exception {
+        restartServer(new BedrockServerLimits(
+                32,
+                20,
+                1400,
+                1_048_576,
+                2_097_152,
+                8_388_608,
+                256,
+                1_048_576,
+                16,
+                16));
+
+        assertLoginRejected(Credentials.OVERSIZED_CAPE);
+        assertLoginRejected(Credentials.OVERSIZED_GEOMETRY);
     }
 
     @Test
@@ -990,10 +1072,15 @@ public class BedrockLoginHandshakeTest {
     private enum Credentials {
         VALID,
         EXPIRED_IDENTITY,
+        INVALID_IDENTITY_SIGNATURE,
         INVALID_CLIENT_SIGNATURE,
         MISMATCHED_CLIENT_DATA,
+        MALFORMED_CLIENT_DATA,
         PERSONA_SKIN,
-        OVERSIZED_SKIN
+        OVERSIZED_SKIN,
+        OVERSIZED_CAPE,
+        OVERSIZED_GEOMETRY,
+        INVALID_RESOURCE_PACK_ORDER
     }
 
     private static final class RecordingJavaConnection extends PlayerConnection {
@@ -1016,6 +1103,7 @@ public class BedrockLoginHandshakeTest {
         private final String identityJwt;
         private final String clientJwt;
         private final String name;
+        private final Credentials credentials;
 
         private final BedrockClientSession session;
         private final Channel channel;
@@ -1045,6 +1133,7 @@ public class BedrockLoginHandshakeTest {
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
                 throws Exception {
             this.name = name;
+            this.credentials = credentials;
             String publicKey = Base64.getEncoder().encodeToString(identityKey.getPublic().getEncoded());
             JwtClaims identityClaims = new JwtClaims();
             identityClaims.setIssuedAtToNow();
@@ -1055,13 +1144,17 @@ public class BedrockLoginHandshakeTest {
                     "displayName", name,
                     "identity", UUID.randomUUID().toString(),
                     "XUID", ""));
-            identityJwt = sign(identityClaims, identityKey);
+            identityJwt = credentials == Credentials.INVALID_IDENTITY_SIGNATURE
+                    ? sign(identityClaims, identityKey, EncryptionUtils.createKeyPair())
+                    : sign(identityClaims, identityKey);
 
             JwtClaims clientClaims = new JwtClaims();
             clientClaims.setClaim(
                     "ThirdPartyName",
                     credentials == Credentials.MISMATCHED_CLIENT_DATA ? "AnotherPlayer" : name);
-            clientClaims.setClaim("DeviceOS", 7);
+            clientClaims.setClaim(
+                    "DeviceOS",
+                    credentials == Credentials.MALFORMED_CLIENT_DATA ? "invalid" : 7);
             clientClaims.setClaim("DeviceId", UUID.randomUUID().toString());
             clientClaims.setClaim("GameVersion", "1.26.30");
             final int skinSize = credentials == Credentials.OVERSIZED_SKIN ? 128 : 64;
@@ -1074,6 +1167,16 @@ public class BedrockLoginHandshakeTest {
                             skinSize == 64 ? CLASSIC_SKIN : classicSkin(skinSize, skinSize)));
             clientClaims.setClaim("PersonaSkin", credentials == Credentials.PERSONA_SKIN);
             clientClaims.setClaim("ArmSize", "wide");
+            if (credentials == Credentials.OVERSIZED_CAPE) {
+                clientClaims.setClaim(
+                        "CapeData",
+                        Base64.getEncoder().encodeToString(new byte[32]));
+            }
+            if (credentials == Credentials.OVERSIZED_GEOMETRY) {
+                clientClaims.setClaim(
+                        "SkinGeometryData",
+                        Base64.getEncoder().encodeToString(new byte[32]));
+            }
             clientJwt = sign(
                     clientClaims,
                     credentials == Credentials.INVALID_CLIENT_SIGNATURE
@@ -1203,7 +1306,11 @@ public class BedrockLoginHandshakeTest {
         public void close() {
             if (!closed.compareAndSet(false, true)) return;
             if (session.isConnected()) {
-                session.disconnect("Test client closed");
+                try {
+                    session.disconnect("Test client closed");
+                } catch (IllegalStateException exception) {
+                    if (session.isConnected()) throw exception;
+                }
             }
             channel.close().syncUninterruptibly();
             eventLoopGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
@@ -1265,7 +1372,9 @@ public class BedrockLoginHandshakeTest {
                 resourcePacksInfoEmpty =
                         packet.getBehaviorPackInfos().isEmpty() && packet.getResourcePackInfos().isEmpty();
                 var response = new ResourcePackClientResponsePacket();
-                response.setStatus(ResourcePackClientResponsePacket.Status.HAVE_ALL_PACKS);
+                response.setStatus(credentials == Credentials.INVALID_RESOURCE_PACK_ORDER
+                        ? ResourcePackClientResponsePacket.Status.COMPLETED
+                        : ResourcePackClientResponsePacket.Status.HAVE_ALL_PACKS);
                 session.sendPacket(response);
                 return PacketSignal.HANDLED;
             }
@@ -1410,12 +1519,19 @@ public class BedrockLoginHandshakeTest {
     }
 
     private static String sign(JwtClaims claims, KeyPair keyPair) throws Exception {
+        return sign(claims, keyPair, keyPair);
+    }
+
+    private static String sign(
+            JwtClaims claims,
+            KeyPair headerKeyPair,
+            KeyPair signingKeyPair) throws Exception {
         var signature = new JsonWebSignature();
         signature.setAlgorithmHeaderValue(EncryptionUtils.ALGORITHM_TYPE);
         signature.setHeader(
                 HeaderParameterNames.X509_URL,
-                Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded()));
-        signature.setKey(keyPair.getPrivate());
+                Base64.getEncoder().encodeToString(headerKeyPair.getPublic().getEncoded()));
+        signature.setKey(signingKeyPair.getPrivate());
         signature.setPayload(claims.toJson());
         return signature.getCompactSerialization();
     }

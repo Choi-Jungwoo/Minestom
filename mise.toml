@@ -34,6 +34,11 @@ run = "gradle :bedrock:acceptanceTest"
 description = "Report immutable Bedrock compatibility pins"
 run = "gradle :bedrock:compatibilityReport"
 
+[tasks.bedrock-update]
+description = "Install one reviewed immutable Bedrock compatibility manifest"
+usage = 'arg "<manifest>" help="Reviewed compatibility properties file"'
+run = 'gradle :bedrock:updateCompatibilityPins "-PbedrockCompatibilityFile=${usage_manifest?}"'
+
 [tasks.bedrock-mappings-verify]
 description = "Verify an operator-provided Bedrock mappings directory"
 usage = 'arg "<directory>" help="Mapping directory to verify"'

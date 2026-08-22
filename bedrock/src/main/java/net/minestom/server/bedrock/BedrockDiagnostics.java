@@ -32,15 +32,15 @@ final class BedrockDiagnostics {
         this.maximumEventsPerMinute = maximumEventsPerMinute;
     }
 
-    void rejection(
+    boolean rejection(
             int protocol,
             String state,
             String packetType,
             Throwable cause) {
-        rejection(protocol, state, packetType, cause.getClass().getSimpleName());
+        return rejection(protocol, state, packetType, cause.getClass().getSimpleName());
     }
 
-    synchronized void rejection(
+    synchronized boolean rejection(
             int protocol,
             String state,
             String packetType,
@@ -54,7 +54,7 @@ final class BedrockDiagnostics {
         }
         final int count = window.count() + 1;
         windows.put(key, new Window(minute, count));
-        if (count > maximumEventsPerMinute) return;
+        if (count > maximumEventsPerMinute) return false;
 
         logger.log(
                 System.Logger.Level.WARNING,
@@ -62,6 +62,7 @@ final class BedrockDiagnostics {
                         + " state=" + state
                         + " packet=" + packetType
                         + " cause=" + causeType);
+        return true;
     }
 
     private void removeOldest() {

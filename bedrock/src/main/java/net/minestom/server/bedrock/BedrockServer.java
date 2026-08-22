@@ -78,7 +78,6 @@ public final class BedrockServer {
     private static final long SHUTDOWN_DRAIN_MILLIS = 100;
     private static final int MAX_CONCURRENT_PINGS = 64;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
-    private static final String ACCEPTED_PROTOCOLS = BedrockProtocol.acceptedVersionsDescription();
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacySection();
     private static final IdentityHashMap<ServerProcess, BedrockServer> INSTANCES = new IdentityHashMap<>();
 
@@ -87,6 +86,7 @@ public final class BedrockServer {
     private final BedrockServerConfig config;
     private final BedrockServerLimits limits;
     private final @Nullable BedrockMappings preloadedMappings;
+    private final @Nullable BedrockTransport transportOverride;
     private final BedrockDiagnostics diagnostics = new BedrockDiagnostics();
     private final Set<BedrockServerSession> sessions = ConcurrentHashMap.newKeySet();
 
@@ -99,13 +99,14 @@ public final class BedrockServer {
     private BedrockServer(
             ServerProcess process,
             BedrockServerConfig config,
-            BedrockServerLimits limits,
-            @Nullable BedrockMappings preloadedMappings) {
+            @Nullable BedrockMappings preloadedMappings,
+            @Nullable BedrockTransport transportOverride) {
         this.process = process;
         this.eventHandler = process.eventHandler();
         this.config = config;
-        this.limits = limits;
+        this.limits = config.limits();
         this.preloadedMappings = preloadedMappings;
+        this.transportOverride = transportOverride;
     }
 
     /**
@@ -141,22 +142,7 @@ public final class BedrockServer {
      */
     public static synchronized BedrockServer create(
             ServerProcess process, BedrockServerConfig config) {
-        return create(process, config, BedrockServerLimits.defaults());
-    }
-
-    /**
-     * Returns the single configured Bedrock server owned by a Minestom process.
-     *
-     * @param process the owning process
-     * @param config  immutable listener, instance, and mappings settings
-     * @param limits  hard listener and protocol resource limits
-     * @return the process Bedrock server
-     */
-    public static synchronized BedrockServer create(
-            ServerProcess process,
-            BedrockServerConfig config,
-            BedrockServerLimits limits) {
-        return create(process, config, limits, null);
+        return create(process, config, null, null);
     }
 
     static synchronized BedrockServer createForTesting(
@@ -174,33 +160,64 @@ public final class BedrockServer {
                 && existing.limits.equals(limits)) {
             return existing;
         }
+        final BedrockServerConfig config = new BedrockServerConfig(
+                address,
+                process.instance().createInstanceContainer(),
+                Path.of("."),
+                1,
+                limits,
+                BedrockVersionPolicy.defaults(),
+                BedrockAdvertisement.defaults());
+        return createForTesting(process, config);
+    }
+
+    static synchronized BedrockServer createForTesting(
+            ServerProcess process, BedrockServerConfig config) {
+        final BedrockServer existing = INSTANCES.get(process);
+        if (existing != null && existing.config.equals(config)) return existing;
         return create(
                 process,
-                new BedrockServerConfig(
-                        address,
-                        process.instance().createInstanceContainer(),
-                        Path.of(".")),
-                limits,
-                BedrockMappings.testing(process));
+                config,
+                BedrockMappings.testing(process),
+                BedrockTransport.available().getFirst());
+    }
+
+    static synchronized BedrockServer createForTesting(
+            ServerProcess process,
+            InetSocketAddress address,
+            BedrockTransport transport) {
+        final BedrockServerConfig config = new BedrockServerConfig(
+                address,
+                process.instance().createInstanceContainer(),
+                Path.of("."),
+                1,
+                BedrockServerLimits.defaults(),
+                BedrockVersionPolicy.defaults(),
+                BedrockAdvertisement.defaults());
+        return create(
+                process,
+                config,
+                BedrockMappings.testing(process),
+                Objects.requireNonNull(transport, "transport"));
     }
 
     private static BedrockServer create(
             ServerProcess process,
             BedrockServerConfig config,
-            BedrockServerLimits limits,
-            @Nullable BedrockMappings preloadedMappings) {
+            @Nullable BedrockMappings preloadedMappings,
+            @Nullable BedrockTransport transportOverride) {
         Objects.requireNonNull(process, "process");
         Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(limits, "limits");
         final BedrockServer existing = INSTANCES.get(process);
         if (existing != null) {
-            if (!existing.config.equals(config) || !existing.limits.equals(limits)) {
+            if (!existing.config.equals(config)) {
                 throw new IllegalStateException("A Bedrock server already exists for this process");
             }
             return existing;
         }
 
-        final BedrockServer server = new BedrockServer(process, config, limits, preloadedMappings);
+        final BedrockServer server =
+                new BedrockServer(process, config, preloadedMappings, transportOverride);
         INSTANCES.put(process, server);
         process.scheduler().buildShutdownTask(() -> {
             server.stop();
@@ -221,13 +238,14 @@ public final class BedrockServer {
         try {
             mappings = preloadedMappings != null
                     ? preloadedMappings
-                    : BedrockMappings.load(config.mappingsDirectory());
+                    : BedrockMappings.load(config.mappingsSource());
         } catch (Exception exception) {
             throw new IllegalStateException("Cannot load supported Bedrock mappings", exception);
         }
         mappings.requireRegistryCompatibility(process);
         final ExecutorService pingExecutor = createPingExecutor();
-        final BedrockTransport transport = BedrockTransport.select();
+        final BedrockTransport transport =
+                transportOverride != null ? transportOverride : BedrockTransport.select();
         final EventLoopGroup parentGroup =
                 new MultiThreadIoEventLoopGroup(
                         1,
@@ -244,6 +262,7 @@ public final class BedrockServer {
                     .channelFactory(RakChannelFactory.server(transport.datagramChannel()))
                     .group(parentGroup, childGroup)
                     .option(RakChannelOption.RAK_HANDLE_PING, true)
+                    .option(RakChannelOption.RAK_GUID, config.rakNetGuid())
                     .option(RakChannelOption.RAK_MAX_CONNECTIONS, limits.maxConnections())
                     .option(RakChannelOption.RAK_MAX_MTU, limits.maxMtu())
                     .option(
@@ -319,7 +338,7 @@ public final class BedrockServer {
             final Channel peerChannel = session.getPeer().getChannel();
             if (!peerChannel.isActive()) continue;
             peerChannels.add(peerChannel);
-            failure = cleanup(failure, () -> session.disconnect("Server shutting down"));
+            failure = cleanup(failure, () -> disconnectSession(session));
             try {
                 drainFutures.add(peerChannel.eventLoop()
                         .schedule(peerChannel::flush, SHUTDOWN_DRAIN_MILLIS, TimeUnit.MILLISECONDS));
@@ -334,6 +353,39 @@ public final class BedrockServer {
             failure = cleanup(failure, () -> peerChannel.close().syncUninterruptibly());
         }
         return failure;
+    }
+
+    private static void disconnectSession(BedrockServerSession session) {
+        try {
+            session.disconnect("Server shutting down");
+        } catch (IllegalStateException exception) {
+            if (session.isConnected()) throw exception;
+        }
+    }
+
+    private void reportRejection(
+            int protocol,
+            String state,
+            String packetType,
+            Throwable cause) {
+        reportRejection(
+                protocol,
+                state,
+                packetType,
+                cause.getClass().getSimpleName());
+    }
+
+    private void reportRejection(
+            int protocol,
+            String state,
+            String packetType,
+            String causeType) {
+        if (!diagnostics.rejection(protocol, state, packetType, causeType)) return;
+        process.exception().handleException(new IllegalStateException(
+                "Bedrock protocol failure protocol=" + protocol
+                        + " state=" + state
+                        + " packet=" + packetType
+                        + " cause=" + causeType));
     }
 
     private static @Nullable RuntimeException cleanup(
@@ -430,7 +482,7 @@ public final class BedrockServer {
         protected void initSession(BedrockServerSession session) {
             server.sessions.add(session);
             session.setCodec(Objects.requireNonNull(
-                    BedrockProtocol.codec(BedrockCompatibility.PRIMARY_PROTOCOL)));
+                    BedrockProtocol.codec(server.config.versionPolicy().primaryProtocol())));
             final HandshakeHandler handler = new HandshakeHandler(server, session);
             session.setPacketHandler(handler);
             final var pipeline = session.getPeer().getChannel().pipeline();
@@ -461,7 +513,7 @@ public final class BedrockServer {
         public void exceptionCaught(ChannelHandlerContext context, Throwable cause) {
             if (disconnected) return;
             disconnected = true;
-            server.diagnostics.rejection(
+            server.reportRejection(
                     session.getCodec().getProtocolVersion(),
                     handler.phase.name(),
                     "BedrockBatch",
@@ -513,7 +565,7 @@ public final class BedrockServer {
         @Override
         public PacketSignal handlePacket(BedrockPacket packet) {
             if (!inboundLimit.accept()) {
-                server.diagnostics.rejection(
+                server.reportRejection(
                         session.getCodec().getProtocolVersion(),
                         phase.name(),
                         packet.getClass().getSimpleName(),
@@ -533,9 +585,10 @@ public final class BedrockServer {
 
             final int protocolVersion = request.getProtocolVersion();
             final BedrockCodec codec = BedrockProtocol.codec(protocolVersion);
-            if (codec == null) {
+            final BedrockVersionPolicy versionPolicy = server.config.versionPolicy();
+            if (codec == null || !versionPolicy.accepts(protocolVersion)) {
                 session.disconnect("Unsupported Bedrock protocol " + protocolVersion +
-                        "; expected one of " + ACCEPTED_PROTOCOLS);
+                        "; expected one of " + versionPolicy.acceptedProtocolsDescription());
                 return PacketSignal.HANDLED;
             }
 
@@ -569,7 +622,8 @@ public final class BedrockServer {
                         (InetSocketAddress) peerChannel.localAddress(),
                         Objects.requireNonNull(server.mappings, "Bedrock mappings were not loaded"),
                         server.process,
-                        verified.skin());
+                        verified.skin(),
+                        server.diagnostics);
                 final KeyPair serverKeyPair = EncryptionUtils.createKeyPair();
                 final byte[] token = EncryptionUtils.generateRandomToken();
                 final ServerToClientHandshakePacket handshake = new ServerToClientHandshakePacket();
@@ -579,7 +633,7 @@ public final class BedrockServer {
                         serverKeyPair.getPrivate(), verified.clientKey(), token));
                 phase = HandshakePhase.LOGIN;
             } catch (Exception exception) {
-                server.diagnostics.rejection(
+                server.reportRejection(
                         login.getProtocolVersion(),
                         phase.name(),
                         LoginPacket.class.getSimpleName(),
@@ -797,17 +851,21 @@ public final class BedrockServer {
         final Status.PlayerInfo playerInfo = status.playerInfo();
         final int port = ((InetSocketAddress) context.channel().localAddress()).getPort();
         final long serverId = context.channel().config().getOption(RakChannelOption.RAK_GUID);
+        final BedrockVersionPolicy versionPolicy = config.versionPolicy();
+        final BedrockCodec primaryCodec = Objects.requireNonNull(
+                BedrockProtocol.codec(versionPolicy.primaryProtocol()));
+        final BedrockAdvertisement advertisement = config.advertisement();
         final BedrockPong pong = new BedrockPong()
-                .edition("MCPE")
+                .edition(advertisement.edition())
                 .motd(LEGACY.serialize(status.description()))
-                .protocolVersion(1001)
-                .version("1.26.30")
+                .protocolVersion(versionPolicy.primaryProtocol())
+                .version(primaryCodec.getMinecraftVersion())
                 .playerCount(playerInfo == null ? 0 : playerInfo.onlinePlayers())
                 .maximumPlayerCount(playerInfo == null ? 1 : playerInfo.maxPlayers())
                 .serverId(serverId)
-                .subMotd("Minestom")
-                .gameType("Survival")
-                .nintendoLimited(false)
+                .subMotd(advertisement.subMotd())
+                .gameType(advertisement.gameType())
+                .nintendoLimited(advertisement.nintendoLimited())
                 .ipv4Port(port)
                 .ipv6Port(port);
         context.writeAndFlush(ping.reply(serverId, pong.toByteBuf()))

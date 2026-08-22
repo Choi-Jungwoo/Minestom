@@ -13,6 +13,8 @@ import org.cloudburstmc.netty.channel.raknet.RakConstants;
  * @param maxDecompressedBatchBytes      maximum decompressed Bedrock batch size
  * @param maxPacketsPerTick              maximum packets processed per connection per tick window
  * @param maxJwtBytes                    maximum combined login JWT size
+ * @param maxCapeBytes                   maximum decoded cape input size
+ * @param maxGeometryBytes               maximum decoded skin geometry input size
  */
 public record BedrockServerLimits(
         int maxConnections,
@@ -22,7 +24,11 @@ public record BedrockServerLimits(
         int maxCompressedBatchBytes,
         int maxDecompressedBatchBytes,
         int maxPacketsPerTick,
-        int maxJwtBytes) {
+        int maxJwtBytes,
+        int maxCapeBytes,
+        int maxGeometryBytes) {
+    private static final int DEFAULT_MAX_CAPE_BYTES = 65_536;
+    private static final int DEFAULT_MAX_GEOMETRY_BYTES = 262_144;
     private static final BedrockServerLimits DEFAULTS = new BedrockServerLimits(
             1_024,
             20,
@@ -31,7 +37,9 @@ public record BedrockServerLimits(
             2_097_152,
             8_388_608,
             256,
-            1_048_576);
+            1_048_576,
+            DEFAULT_MAX_CAPE_BYTES,
+            DEFAULT_MAX_GEOMETRY_BYTES);
 
     public BedrockServerLimits {
         requirePositive(maxConnections, "maxConnections");
@@ -42,6 +50,8 @@ public record BedrockServerLimits(
         requirePositive(maxDecompressedBatchBytes, "maxDecompressedBatchBytes");
         requirePositive(maxPacketsPerTick, "maxPacketsPerTick");
         requirePositive(maxJwtBytes, "maxJwtBytes");
+        requirePositive(maxCapeBytes, "maxCapeBytes");
+        requirePositive(maxGeometryBytes, "maxGeometryBytes");
         if (maxMtu < RakConstants.MINIMUM_MTU_SIZE
                 || maxMtu > RakConstants.MAXIMUM_MTU_SIZE) {
             throw new IllegalArgumentException(
@@ -54,6 +64,28 @@ public record BedrockServerLimits(
             throw new IllegalArgumentException(
                     "maxDecompressedBatchBytes must be at least maxPacketBytes");
         }
+    }
+
+    public BedrockServerLimits(
+            int maxConnections,
+            int maxConnectionAttemptsPerSecond,
+            int maxMtu,
+            int maxPacketBytes,
+            int maxCompressedBatchBytes,
+            int maxDecompressedBatchBytes,
+            int maxPacketsPerTick,
+            int maxJwtBytes) {
+        this(
+                maxConnections,
+                maxConnectionAttemptsPerSecond,
+                maxMtu,
+                maxPacketBytes,
+                maxCompressedBatchBytes,
+                maxDecompressedBatchBytes,
+                maxPacketsPerTick,
+                maxJwtBytes,
+                DEFAULT_MAX_CAPE_BYTES,
+                DEFAULT_MAX_GEOMETRY_BYTES);
     }
 
     /**

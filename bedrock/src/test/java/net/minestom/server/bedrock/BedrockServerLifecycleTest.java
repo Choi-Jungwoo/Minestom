@@ -104,13 +104,9 @@ public class BedrockServerLifecycleTest {
     }
 
     @Test
-    void additiveLimitsOverloadKeepsProcessSingletonConfigurationStable() {
+    void configLimitsParticipateInProcessSingletonIdentity() {
         process = MinecraftServer.updateProcess();
         final var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
-        final var config = new BedrockServerConfig(
-                address,
-                process.instance().createInstanceContainer(),
-                mappingsDirectory);
         final BedrockServerLimits limits = new BedrockServerLimits(
                 8,
                 4,
@@ -120,13 +116,29 @@ public class BedrockServerLifecycleTest {
                 65_536,
                 32,
                 16_384);
+        final var config = new BedrockServerConfig(
+                address,
+                process.instance().createInstanceContainer(),
+                mappingsDirectory,
+                42,
+                limits,
+                BedrockVersionPolicy.defaults(),
+                BedrockAdvertisement.defaults());
 
-        server = BedrockServer.create(process, config, limits);
+        server = BedrockServer.create(process, config);
 
-        assertSame(server, BedrockServer.create(process, config, limits));
+        assertSame(server, BedrockServer.create(process, config));
+        final var differentConfig = new BedrockServerConfig(
+                address,
+                config.spawningInstance(),
+                mappingsDirectory,
+                42,
+                BedrockServerLimits.defaults(),
+                BedrockVersionPolicy.defaults(),
+                BedrockAdvertisement.defaults());
         assertThrows(
                 IllegalStateException.class,
-                () -> BedrockServer.create(process, config, BedrockServerLimits.defaults()));
+                () -> BedrockServer.create(process, differentConfig));
     }
 
     private static Set<Long> bedrockEventLoopThreads() {
