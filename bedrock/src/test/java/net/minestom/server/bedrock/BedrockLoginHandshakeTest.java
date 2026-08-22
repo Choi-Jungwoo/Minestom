@@ -7,13 +7,20 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import net.kyori.adventure.text.Component;
 import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.component.DataComponents;
 import net.minestom.server.coordinate.Pos;
+import net.minestom.server.entity.Entity;
+import net.minestom.server.entity.EntityType;
+import net.minestom.server.entity.EquipmentSlot;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.player.AsyncPlayerPreLoginEvent;
 import net.minestom.server.event.player.PlayerMoveEvent;
 import net.minestom.server.instance.block.Block;
+import net.minestom.server.item.ItemStack;
+import net.minestom.server.item.Material;
 import net.minestom.server.network.player.GameProfile;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.cloudburstmc.math.vector.Vector3f;
@@ -31,9 +38,14 @@ import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.data.auth.AuthType;
 import org.cloudburstmc.protocol.bedrock.data.auth.CertificateChainPayload;
 import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.ItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleItemDefinition;
+import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataTypes;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockClientInitializer;
 import org.cloudburstmc.protocol.bedrock.netty.codec.packet.BedrockPacketCodec;
+import org.cloudburstmc.protocol.bedrock.packet.AddEntityPacket;
+import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
 import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
@@ -41,15 +53,19 @@ import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
+import org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayerListPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RequestNetworkSettingsPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackClientResponsePacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackStackPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket;
+import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ServerToClientHandshakePacket;
+import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.StartGamePacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
@@ -260,6 +276,168 @@ public class BedrockLoginHandshakeTest {
         }
     }
 
+    @Test
+    @SuppressWarnings("deprecation")
+    void bedrockPlayersSeeOneAnother() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var visible = new LoginClient(
+                     server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            visible.begin();
+            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            Player visiblePlayer = awaitPlayer("Visible");
+
+            assertTrue(tickUntil(() -> observer.playerLists.stream()
+                    .filter(packet -> packet.getAction() == PlayerListPacket.Action.ADD)
+                    .flatMap(packet -> packet.getEntries().stream())
+                    .anyMatch(entry -> entry.getUuid().equals(visiblePlayer.getUuid()))));
+            assertTrue(tickUntil(() -> observer.addedPlayers.stream()
+                    .anyMatch(packet ->
+                            packet.getRuntimeEntityId() == visiblePlayer.getEntityId()
+                                    && packet.getUuid().equals(visiblePlayer.getUuid()))));
+        }
+    }
+
+    @Test
+    void bedrockObserverSeesPlayerMovement() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var mover = new LoginClient(
+                     server.boundAddress(), "Mover", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            mover.begin();
+            assertTrue(mover.completed.await(3, TimeUnit.SECONDS), () -> mover.stage);
+            Player moverPlayer = awaitPlayer("Mover");
+            mover.move(moverPlayer.getPosition(), 1, PlayerAuthInputData.HANDLE_TELEPORT);
+            assertTrue(tickUntil(() ->
+                    moverPlayer.getLastSentTeleportId() == moverPlayer.getLastReceivedTeleportId()));
+            observer.moves.clear();
+
+            mover.move(new Pos(5, 0, 0), 2);
+
+            assertTrue(tickUntil(() -> observer.moves.stream()
+                    .anyMatch(packet -> packet.getRuntimeEntityId() == moverPlayer.getEntityId()
+                            && packet.getPosition().getX() == 5)));
+        }
+    }
+
+    @Test
+    void bedrockObserverSeesBasicPlayerMetadata() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var visible = new LoginClient(
+                     server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            visible.begin();
+            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            Player visiblePlayer = awaitPlayer("Visible");
+            observer.entityData.clear();
+
+            visiblePlayer.set(DataComponents.CUSTOM_NAME, Component.text("Display Name"));
+            visiblePlayer.setCustomNameVisible(true);
+
+            assertTrue(tickUntil(() -> observer.entityData.stream()
+                    .filter(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId())
+                    .map(packet -> packet.getMetadata().get(EntityDataTypes.NAME))
+                    .anyMatch(name -> name != null && name.toString().equals("Display Name"))));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void bedrockObserverSeesPlayerRemoval() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var visible = new LoginClient(
+                     server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            visible.begin();
+            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            Player visiblePlayer = awaitPlayer("Visible");
+            assertTrue(tickUntil(() -> observer.addedPlayers.stream()
+                    .anyMatch(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId())));
+            observer.removedEntities.clear();
+            observer.playerLists.clear();
+
+            visiblePlayer.remove();
+
+            assertTrue(tickUntil(() -> observer.removedEntities.stream()
+                    .anyMatch(packet -> packet.getUniqueEntityId() == visiblePlayer.getEntityId())));
+            assertTrue(tickUntil(() -> observer.playerLists.stream()
+                    .filter(packet -> packet.getAction() == PlayerListPacket.Action.REMOVE)
+                    .flatMap(packet -> packet.getEntries().stream())
+                    .anyMatch(entry -> entry.getUuid().equals(visiblePlayer.getUuid()))));
+        }
+    }
+
+    @Test
+    void bedrockObserverSeesPlayerEquipment() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var visible = new LoginClient(
+                     server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            visible.begin();
+            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            Player visiblePlayer = awaitPlayer("Visible");
+            assertTrue(tickUntil(() -> observer.addedPlayers.stream()
+                    .anyMatch(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId())));
+            observer.equipment.clear();
+
+            visiblePlayer.setEquipment(
+                    EquipmentSlot.MAIN_HAND,
+                    ItemStack.of(Material.STONE));
+
+            assertTrue(tickUntil(() -> observer.equipment.stream()
+                    .anyMatch(packet -> packet.getRuntimeEntityId() == visiblePlayer.getEntityId()
+                            && packet.getItem() != null
+                            && packet.getItem().getDefinition() != null
+                            && packet.getItem().getDefinition().getIdentifier()
+                            .equals("minecraft:stone"))), () -> observer.equipment.toString());
+        }
+    }
+
+    @Test
+    void bedrockObserverDoesNotReceiveNonPlayerEntities() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+            observer.addedEntities.clear();
+            observer.addedPlayers.clear();
+
+            final Entity zombie = new Entity(EntityType.ZOMBIE);
+            zombie.setInstance(server.spawningInstance(), Pos.ZERO).join();
+            for (int index = 0; index < 20; index++) {
+                tick();
+                Thread.sleep(10);
+            }
+
+            assertTrue(observer.addedEntities.stream()
+                    .noneMatch(packet -> packet.getRuntimeEntityId() == zombie.getEntityId()));
+            assertTrue(observer.addedPlayers.stream()
+                    .noneMatch(packet -> packet.getRuntimeEntityId() == zombie.getEntityId()));
+            zombie.remove();
+        }
+    }
+
     private void assertLoginRejected(Credentials credentials) throws Exception {
         try (var client = new LoginClient(
                 server.boundAddress(), "LoopbackPlayer", AuthType.SELF_SIGNED, credentials)) {
@@ -279,6 +457,15 @@ public class BedrockLoginHandshakeTest {
         }
         assertEquals(1, process.connection().getOnlinePlayerCount());
         return process.connection().getOnlinePlayers().iterator().next();
+    }
+
+    private Player awaitPlayer(String name) throws InterruptedException {
+        assertTrue(tickUntil(() -> process.connection().getOnlinePlayers().stream()
+                .anyMatch(player -> player.getUsername().equals(name))));
+        return process.connection().getOnlinePlayers().stream()
+                .filter(player -> player.getUsername().equals(name))
+                .findFirst()
+                .orElseThrow();
     }
 
     private boolean tickUntil(BooleanSupplier condition) throws InterruptedException {
@@ -328,6 +515,12 @@ public class BedrockLoginHandshakeTest {
         private final BlockingQueue<UpdateBlockPacket> blockUpdates = new LinkedBlockingQueue<>();
         private final BlockingQueue<MovePlayerPacket> moves = new LinkedBlockingQueue<>();
         private final BlockingQueue<ChangeDimensionPacket> dimensionChanges = new LinkedBlockingQueue<>();
+        private final BlockingQueue<PlayerListPacket> playerLists = new LinkedBlockingQueue<>();
+        private final BlockingQueue<AddEntityPacket> addedEntities = new LinkedBlockingQueue<>();
+        private final BlockingQueue<AddPlayerPacket> addedPlayers = new LinkedBlockingQueue<>();
+        private final BlockingQueue<SetEntityDataPacket> entityData = new LinkedBlockingQueue<>();
+        private final BlockingQueue<RemoveEntityPacket> removedEntities = new LinkedBlockingQueue<>();
+        private final BlockingQueue<MobEquipmentPacket> equipment = new LinkedBlockingQueue<>();
 
         private LoginClient(
                 InetSocketAddress address, String name, AuthType authType, Credentials credentials)
@@ -373,6 +566,12 @@ public class BedrockLoginHandshakeTest {
                                     .get(BedrockPacketCodec.class)
                                     .getHelper()
                                     .setBlockDefinitions(blockDefinitions());
+                            session.getPeer()
+                                    .getChannel()
+                                    .pipeline()
+                                    .get(BedrockPacketCodec.class)
+                                    .getHelper()
+                                    .setItemDefinitions(itemDefinitions());
                             session.setPacketHandler(new LoginHandler(session, authType));
                             sessionHolder[0] = session;
                             connected.countDown();
@@ -394,6 +593,24 @@ public class BedrockLoginHandshakeTest {
                         block.key().asString(), stateId, NbtMap.EMPTY));
             }
             return SimpleDefinitionRegistry.<BlockDefinition>builder()
+                    .addAll(definitions)
+                    .build();
+        }
+
+        private static SimpleDefinitionRegistry<ItemDefinition> itemDefinitions() {
+            final List<String> keys = Material.values().stream()
+                    .map(material -> material.key().asString())
+                    .sorted()
+                    .toList();
+            final List<ItemDefinition> definitions = new ArrayList<>(keys.size());
+            definitions.add(new SimpleItemDefinition("minecraft:air", 0, true));
+            int runtimeId = 1;
+            for (String key : keys) {
+                if (!key.equals("minecraft:air")) {
+                    definitions.add(new SimpleItemDefinition(key, runtimeId++, true));
+                }
+            }
+            return SimpleDefinitionRegistry.<ItemDefinition>builder()
                     .addAll(definitions)
                     .build();
         }
@@ -555,6 +772,42 @@ public class BedrockLoginHandshakeTest {
                 complete.setResultPosition(Vector3i.ZERO);
                 complete.setFace(0);
                 session.sendPacket(complete);
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(PlayerListPacket packet) {
+                playerLists.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(AddEntityPacket packet) {
+                addedEntities.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(AddPlayerPacket packet) {
+                addedPlayers.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(SetEntityDataPacket packet) {
+                entityData.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(RemoveEntityPacket packet) {
+                removedEntities.add(packet.clone());
+                return PacketSignal.HANDLED;
+            }
+
+            @Override
+            public PacketSignal handle(MobEquipmentPacket packet) {
+                equipment.add(packet.clone());
                 return PacketSignal.HANDLED;
             }
 

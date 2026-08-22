@@ -4,17 +4,31 @@ import io.netty.buffer.ByteBuf;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.minestom.server.ServerProcess;
+import net.minestom.server.component.DataComponents;
 import net.minestom.server.coordinate.CoordConversion;
 import net.minestom.server.coordinate.Pos;
+import net.minestom.server.entity.EntityType;
+import net.minestom.server.entity.EquipmentSlot;
 import net.minestom.server.entity.Player;
 import net.minestom.server.instance.Chunk;
 import net.minestom.server.instance.Instance;
+import net.minestom.server.item.ItemStack;
+import net.minestom.server.network.ConnectionState;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
 import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
+import net.minestom.server.network.packet.server.CachedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.packet.server.play.BlockChangePacket;
+import net.minestom.server.network.packet.server.play.DestroyEntitiesPacket;
+import net.minestom.server.network.packet.server.play.EntityEquipmentPacket;
+import net.minestom.server.network.packet.server.play.EntityMetaDataPacket;
+import net.minestom.server.network.packet.server.play.EntityPositionAndRotationPacket;
+import net.minestom.server.network.packet.server.play.EntityPositionPacket;
 import net.minestom.server.network.packet.server.play.MultiBlockChangePacket;
+import net.minestom.server.network.packet.server.play.PlayerInfoRemovePacket;
+import net.minestom.server.network.packet.server.play.PlayerInfoUpdatePacket;
 import net.minestom.server.network.packet.server.play.PlayerPositionAndLookPacket;
+import net.minestom.server.network.packet.server.play.SpawnEntityPacket;
 import net.minestom.server.network.packet.server.play.UnloadChunkPacket;
 import net.minestom.server.network.packet.server.play.UpdateViewPositionPacket;
 import net.minestom.server.network.player.PlayerConnection;
@@ -23,28 +37,48 @@ import net.minestom.server.world.DimensionType;
 import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.math.vector.Vector3i;
 import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
+import org.cloudburstmc.protocol.bedrock.data.BuildPlatform;
 import org.cloudburstmc.protocol.bedrock.data.ClientPlayMode;
+import org.cloudburstmc.protocol.bedrock.data.GameType;
 import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.data.PlayerAuthInputData;
+import org.cloudburstmc.protocol.bedrock.data.PlayerPermission;
+import org.cloudburstmc.protocol.bedrock.data.command.CommandPermission;
+import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataMap;
+import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataTypes;
+import org.cloudburstmc.protocol.bedrock.data.entity.EntityFlag;
+import org.cloudburstmc.protocol.bedrock.data.inventory.ContainerId;
+import org.cloudburstmc.protocol.bedrock.data.inventory.ItemData;
+import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
+import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
+import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.ChangeDimensionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.DisconnectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelChunkPacket;
 import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
+import org.cloudburstmc.protocol.bedrock.packet.MobArmorEquipmentPacket;
+import org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkChunkPublisherUpdatePacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
-import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayerListPacket;
+import org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket;
+import org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.jetbrains.annotations.Nullable;
 
+import java.awt.Color;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.EnumSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -82,6 +116,7 @@ public final class BedrockConnection extends PlayerConnection {
     private final InetSocketAddress serverAddress;
     private final BedrockMappings mappings;
     private final ServerProcess process;
+    private final Map<Integer, UUID> visiblePlayerUuids = new ConcurrentHashMap<>();
     private final AtomicBoolean disconnected = new AtomicBoolean();
     private final AtomicInteger pendingDimensionChanges = new AtomicInteger();
     private final AtomicReference<PendingTeleport> pendingTeleport = new AtomicReference<>();
@@ -111,6 +146,10 @@ public final class BedrockConnection extends PlayerConnection {
     @Override
     public void sendPacket(SendablePacket packet) {
         if (disconnected.get()) return;
+        if (packet instanceof CachedPacket cached) {
+            sendPacket(cached.packet(ConnectionState.PLAY));
+            return;
+        }
         try {
             if (packet instanceof BlockChangePacket change) {
                 sendBlockUpdate(
@@ -126,6 +165,23 @@ public final class BedrockConnection extends PlayerConnection {
                 sendChunkPublisherUpdate(view);
             } else if (packet instanceof PlayerPositionAndLookPacket position) {
                 sendPosition(position);
+            } else if (packet instanceof PlayerInfoUpdatePacket playerInfo) {
+                sendPlayerInfo(playerInfo);
+            } else if (packet instanceof PlayerInfoRemovePacket playerInfo) {
+                sendPlayerInfoRemoval(playerInfo);
+            } else if (packet instanceof SpawnEntityPacket spawn
+                    && spawn.type() == EntityType.PLAYER) {
+                sendPlayerSpawn(spawn);
+            } else if (packet instanceof EntityPositionPacket position) {
+                sendPlayerPosition(position.entityId());
+            } else if (packet instanceof EntityPositionAndRotationPacket position) {
+                sendPlayerPosition(position.entityId());
+            } else if (packet instanceof EntityMetaDataPacket metadata) {
+                sendPlayerMetadata(metadata.entityId());
+            } else if (packet instanceof DestroyEntitiesPacket removals) {
+                sendPlayerRemovals(removals);
+            } else if (packet instanceof EntityEquipmentPacket equipment) {
+                sendPlayerEquipment(equipment);
             }
         } catch (RuntimeException exception) {
             failInstanceData(exception);
@@ -337,6 +393,210 @@ public final class BedrockConnection extends PlayerConnection {
                     0));
         }
         sendBedrockPacket(move);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void sendPlayerInfo(PlayerInfoUpdatePacket packet) {
+        if (!packet.actions().contains(PlayerInfoUpdatePacket.Action.ADD_PLAYER)) return;
+        final PlayerListPacket list = new PlayerListPacket();
+        list.setAction(PlayerListPacket.Action.ADD);
+        for (PlayerInfoUpdatePacket.Entry player : packet.entries()) {
+            final PlayerListPacket.Entry entry = new PlayerListPacket.Entry(player.uuid());
+            entry.setAction(PlayerListPacket.Action.ADD);
+            entry.setEntityId(findPlayerEntityId(player.uuid()));
+            entry.setName(player.username());
+            entry.setXuid("");
+            entry.setPlatformChatId("");
+            entry.setBuildPlatform(BuildPlatform.UNKNOWN);
+            entry.setSkin(fallbackSkin(player.uuid()));
+            entry.setColor(new Color(0, true));
+            list.getEntries().add(entry);
+        }
+        if (!list.getEntries().isEmpty()) sendBedrockPacket(list);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void sendPlayerInfoRemoval(PlayerInfoRemovePacket packet) {
+        final PlayerListPacket list = new PlayerListPacket();
+        list.setAction(PlayerListPacket.Action.REMOVE);
+        for (UUID uuid : packet.uuids()) {
+            final PlayerListPacket.Entry entry = new PlayerListPacket.Entry(uuid);
+            entry.setAction(PlayerListPacket.Action.REMOVE);
+            list.getEntries().add(entry);
+        }
+        if (!list.getEntries().isEmpty()) sendBedrockPacket(list);
+    }
+
+    private void sendPlayerSpawn(SpawnEntityPacket packet) {
+        final Player player = findPlayer(packet.uuid());
+        if (player == null) return;
+        visiblePlayerUuids.put(packet.entityId(), packet.uuid());
+        final Pos position = packet.position();
+        final AddPlayerPacket add = new AddPlayerPacket();
+        add.setUuid(packet.uuid());
+        add.setUsername(player.getUsername());
+        add.setUniqueEntityId(packet.entityId());
+        add.setRuntimeEntityId(packet.entityId());
+        add.setPlatformChatId("");
+        add.setPosition(Vector3f.from(
+                position.x(),
+                position.y() + BedrockStartGame.PLAYER_EYE_HEIGHT,
+                position.z()));
+        add.setMotion(Vector3f.from(
+                packet.velocity().x(),
+                packet.velocity().y(),
+                packet.velocity().z()));
+        add.setRotation(Vector3f.from(
+                position.pitch(),
+                position.yaw(),
+                packet.headRot()));
+        add.setHand(ItemData.AIR);
+        add.setGameType(GameType.SURVIVAL);
+        add.setMetadata(playerMetadata(player));
+        add.setPlayerPermission(PlayerPermission.MEMBER);
+        add.setCommandPermission(CommandPermission.ANY);
+        add.setDeviceId("");
+        add.setBuildPlatform(BuildPlatform.UNKNOWN);
+        sendBedrockPacket(add);
+    }
+
+    private void sendPlayerRemovals(DestroyEntitiesPacket packet) {
+        for (int entityId : packet.entityIds()) {
+            if (visiblePlayerUuids.remove(entityId) == null) continue;
+            final RemoveEntityPacket removal = new RemoveEntityPacket();
+            removal.setUniqueEntityId(entityId);
+            sendBedrockPacket(removal);
+        }
+    }
+
+    private void sendPlayerEquipment(EntityEquipmentPacket packet) {
+        final Player player = findPlayer(packet.entityId());
+        if (player == null) return;
+        for (Map.Entry<EquipmentSlot, ItemStack> equipment : packet.equipments().entrySet()) {
+            if (equipment.getKey().isHand()) {
+                sendHandEquipment(packet.entityId(), equipment.getKey(), equipment.getValue());
+            }
+        }
+        if (packet.equipments().keySet().stream().anyMatch(EquipmentSlot::isArmor)) {
+            sendArmorEquipment(player);
+        }
+    }
+
+    private void sendHandEquipment(int entityId, EquipmentSlot slot, ItemStack stack) {
+        final MobEquipmentPacket equipment = new MobEquipmentPacket();
+        equipment.setRuntimeEntityId(entityId);
+        equipment.setItem(itemData(stack));
+        equipment.setInventorySlot(0);
+        equipment.setHotbarSlot(0);
+        equipment.setContainerId(
+                slot == EquipmentSlot.OFF_HAND ? ContainerId.OFFHAND : ContainerId.INVENTORY);
+        sendBedrockPacket(equipment);
+    }
+
+    private void sendArmorEquipment(Player player) {
+        final MobArmorEquipmentPacket equipment = new MobArmorEquipmentPacket();
+        equipment.setRuntimeEntityId(player.getEntityId());
+        equipment.setHelmet(itemData(player.getEquipment(EquipmentSlot.HELMET)));
+        equipment.setChestplate(itemData(player.getEquipment(EquipmentSlot.CHESTPLATE)));
+        equipment.setLeggings(itemData(player.getEquipment(EquipmentSlot.LEGGINGS)));
+        equipment.setBoots(itemData(player.getEquipment(EquipmentSlot.BOOTS)));
+        equipment.setBody(itemData(player.getEquipment(EquipmentSlot.BODY)));
+        sendBedrockPacket(equipment);
+    }
+
+    private ItemData itemData(ItemStack stack) {
+        if (stack.isAir()) return ItemData.AIR;
+        return ItemData.builder()
+                .definition(mappings.itemDefinition(stack.material().key().asString()))
+                .count(stack.amount())
+                .build();
+    }
+
+    private void sendPlayerPosition(int entityId) {
+        final Player player = findPlayer(entityId);
+        if (player == null) return;
+        final Pos position = player.getPosition();
+        final MovePlayerPacket move = new MovePlayerPacket();
+        move.setRuntimeEntityId(entityId);
+        move.setPosition(Vector3f.from(
+                position.x(),
+                position.y() + BedrockStartGame.PLAYER_EYE_HEIGHT,
+                position.z()));
+        move.setRotation(Vector3f.from(
+                position.pitch(),
+                position.yaw(),
+                position.yaw()));
+        move.setMode(MovePlayerPacket.Mode.NORMAL);
+        move.setOnGround(player.isOnGround());
+        move.setRidingRuntimeEntityId(0);
+        move.setTick(Math.max(0, lastClientTick));
+        sendBedrockPacket(move);
+    }
+
+    private void sendPlayerMetadata(int entityId) {
+        final Player player = findPlayer(entityId);
+        if (player == null) return;
+        final SetEntityDataPacket data = new SetEntityDataPacket();
+        data.setRuntimeEntityId(entityId);
+        data.setMetadata(playerMetadata(player));
+        data.setTick(Math.max(0, lastClientTick));
+        sendBedrockPacket(data);
+    }
+
+    private static EntityDataMap playerMetadata(Player player) {
+        final EntityDataMap metadata = new EntityDataMap();
+        final Component customName = player.get(DataComponents.CUSTOM_NAME);
+        metadata.putType(
+                EntityDataTypes.NAME,
+                customName == null ? player.getUsername() : LEGACY.serialize(customName));
+        metadata.putType(
+                EntityDataTypes.NAMETAG_ALWAYS_SHOW,
+                player.isCustomNameVisible() ? (byte) 1 : (byte) 0);
+        metadata.setFlag(EntityFlag.ON_FIRE, player.isOnFire());
+        metadata.setFlag(EntityFlag.SNEAKING, player.isSneaking());
+        metadata.setFlag(EntityFlag.SPRINTING, player.isSprinting());
+        metadata.setFlag(EntityFlag.INVISIBLE, player.isInvisible());
+        metadata.setFlag(EntityFlag.CAN_SHOW_NAME, true);
+        metadata.setFlag(EntityFlag.ALWAYS_SHOW_NAME, player.isCustomNameVisible());
+        metadata.setFlag(EntityFlag.HAS_GRAVITY, !player.hasNoGravity());
+        return metadata;
+    }
+
+    private long findPlayerEntityId(UUID uuid) {
+        final Player player = findPlayer(uuid);
+        return player == null ? 0 : player.getEntityId();
+    }
+
+    private @Nullable Player findPlayer(UUID uuid) {
+        return process.connection().getOnlinePlayers().stream()
+                .filter(player -> player.getUuid().equals(uuid))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private @Nullable Player findPlayer(int entityId) {
+        final Player player = getPlayer();
+        final Instance instance = player == null ? null : player.getInstance();
+        if (instance == null) return null;
+        return instance.getEntityById(entityId) instanceof Player found ? found : null;
+    }
+
+    private static SerializedSkin fallbackSkin(UUID uuid) {
+        final byte[] pixels = new byte[64 * 64 * 4];
+        for (int pixel = 0; pixel < pixels.length; pixel += 4) {
+            pixels[pixel] = (byte) 0x42;
+            pixels[pixel + 1] = (byte) 0x81;
+            pixels[pixel + 2] = (byte) 0xA4;
+            pixels[pixel + 3] = (byte) 0xFF;
+        }
+        return SerializedSkin.of(
+                "minestom-fallback-" + uuid,
+                "",
+                ImageData.of(64, 64, pixels),
+                ImageData.EMPTY,
+                "geometry.humanoid.custom",
+                "",
+                false);
     }
 
     private void switchInstance(Instance instance) {

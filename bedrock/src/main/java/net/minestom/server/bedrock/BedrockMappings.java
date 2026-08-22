@@ -11,7 +11,9 @@ import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.nbt.NbtUtils;
 import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.ItemDefinition;
 import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleBlockDefinition;
+import org.cloudburstmc.protocol.bedrock.data.definitions.SimpleItemDefinition;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,6 +23,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
@@ -67,14 +70,20 @@ final class BedrockMappings {
     private final Release release;
     private final RegistryCoverage coverage;
     private final List<BlockDefinition> blockDefinitions;
+    private final Map<String, ItemDefinition> itemDefinitionsByJavaKey;
 
     private BedrockMappings(
             Release release,
             RegistryCoverage coverage,
-            List<BlockDefinition> blockDefinitions) {
+            List<BlockDefinition> blockDefinitions,
+            List<ItemDefinition> itemDefinitions) {
         this.release = release;
         this.coverage = coverage;
         this.blockDefinitions = List.copyOf(blockDefinitions);
+        this.itemDefinitionsByJavaKey = itemDefinitions.stream()
+                .collect(Collectors.toUnmodifiableMap(
+                        ItemDefinition::getIdentifier,
+                        definition -> definition));
     }
 
     static BedrockMappings testing(Registries registries) {
@@ -96,7 +105,8 @@ final class BedrockMappings {
                         Block.statesCount(),
                         List.of(),
                         Map.of("minecraft:plains", 1)),
-                blockDefinitions);
+                blockDefinitions,
+                testingItemDefinitions(registries));
     }
 
     static BedrockMappings load(Path directory) throws IOException {
@@ -143,7 +153,42 @@ final class BedrockMappings {
         final RegistryCoverage coverage = validateRegistryCoverage(root);
         final List<BlockDefinition> blockDefinitions =
                 loadBlockDefinitions(root, coverage.blockMappings());
-        return new BedrockMappings(release, coverage, blockDefinitions);
+        return new BedrockMappings(
+                release,
+                coverage,
+                blockDefinitions,
+                loadItemDefinitions(root));
+    }
+
+    private static List<ItemDefinition> testingItemDefinitions(Registries registries) {
+        final List<String> keys = registryKeys(registries.material()).stream()
+                .sorted()
+                .toList();
+        final List<ItemDefinition> definitions = new ArrayList<>(keys.size());
+        definitions.add(new SimpleItemDefinition("minecraft:air", 0, true));
+        int runtimeId = 1;
+        for (String key : keys) {
+            if (key.equals("minecraft:air")) continue;
+            definitions.add(new SimpleItemDefinition(key, runtimeId++, true));
+        }
+        return definitions;
+    }
+
+    private static List<ItemDefinition> loadItemDefinitions(Path root) throws IOException {
+        final JsonElement json;
+        try (var reader = Files.newBufferedReader(root.resolve("item_data_components.json"))) {
+            json = JsonParser.parseReader(reader);
+        }
+        final List<ItemDefinition> definitions = new ArrayList<>();
+        for (JsonElement element : json.getAsJsonArray()) {
+            final JsonObject item = element.getAsJsonObject();
+            definitions.add(new SimpleItemDefinition(
+                    item.get("key").getAsString(),
+                    item.get("id").getAsInt(),
+                    true));
+        }
+        definitions.sort(Comparator.comparingInt(ItemDefinition::getRuntimeId));
+        return definitions;
     }
 
     static String sha256(Path directory, List<String> files) throws IOException {
@@ -413,6 +458,15 @@ final class BedrockMappings {
                     "No Bedrock mapping for Minestom block state " + javaStateId);
         }
         return blockDefinitions.get(javaStateId);
+    }
+
+    ItemDefinition itemDefinition(String javaKey) {
+        final ItemDefinition definition = itemDefinitionsByJavaKey.get(javaKey);
+        if (definition == null) {
+            throw new IllegalArgumentException(
+                    "No Bedrock mapping for Minestom item " + javaKey);
+        }
+        return definition;
     }
 
     int biomeId(int javaBiomeId, Registry<?> biomeRegistry) {
