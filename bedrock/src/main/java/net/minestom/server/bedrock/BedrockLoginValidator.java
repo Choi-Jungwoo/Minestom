@@ -47,7 +47,7 @@ final class BedrockLoginValidator {
 
         final JsonWebSignature clientJwt = verifiedJwt(login.getClientJwt(), clientKey);
         final Map<String, Object> clientData = JsonUtil.parseJson(clientJwt.getUnverifiedPayload());
-        validateTimes(clientData);
+        // Client-data JWTs inherit trust from the expiring identity certificate and have no time claims.
         if (!name.equals(requiredString(clientData, "ThirdPartyName"))) {
             throw new IllegalArgumentException("Client data name does not match the identity");
         }

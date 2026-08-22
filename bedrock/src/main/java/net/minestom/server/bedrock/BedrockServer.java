@@ -57,6 +57,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -64,6 +67,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class BedrockServer {
     private static final long SHUTDOWN_DRAIN_MILLIS = 100;
+    private static final int MAX_CONCURRENT_PINGS = 64;
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 5;
     private static final String SUPPORTED_PROTOCOLS = "924, 944, 975, 1001, 2168";
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacySection();
     private static final Map<Integer, BedrockCodec> CODECS = Map.of(
@@ -81,6 +86,7 @@ public final class BedrockServer {
     private @Nullable Channel channel;
     private @Nullable EventLoopGroup parentGroup;
     private @Nullable EventLoopGroup childGroup;
+    private volatile @Nullable ExecutorService pingExecutor;
 
     private BedrockServer(GlobalEventHandler eventHandler, InetSocketAddress configuredAddress) {
         this.eventHandler = eventHandler;
@@ -125,12 +131,14 @@ public final class BedrockServer {
     public synchronized void start() {
         if (isStarted()) return;
 
+        final ExecutorService pingExecutor = createPingExecutor();
         final EventLoopGroup parentGroup =
                 new MultiThreadIoEventLoopGroup(
                         1, new DefaultThreadFactory("minestom-bedrock-parent", true), NioIoHandler.newFactory());
         final EventLoopGroup childGroup =
                 new MultiThreadIoEventLoopGroup(
                         0, new DefaultThreadFactory("minestom-bedrock-child", true), NioIoHandler.newFactory());
+        this.pingExecutor = pingExecutor;
         try {
             final Channel channel = new ServerBootstrap()
                     .channelFactory(RakChannelFactory.server(NioDatagramChannel.class))
@@ -151,6 +159,8 @@ public final class BedrockServer {
             this.childGroup = childGroup;
             this.channel = channel;
         } catch (RuntimeException exception) {
+            this.pingExecutor = null;
+            shutdown(pingExecutor);
             shutdown(parentGroup);
             shutdown(childGroup);
             throw exception;
@@ -165,33 +175,65 @@ public final class BedrockServer {
         final Channel channel = this.channel;
         if (channel == null) return;
 
+        final EventLoopGroup childGroup = this.childGroup;
+        final EventLoopGroup parentGroup = this.parentGroup;
+        final ExecutorService pingExecutor = this.pingExecutor;
         this.channel = null;
-        disconnectSessions();
-        sessions.clear();
-        channel.close().syncUninterruptibly();
-        shutdown(this.childGroup);
-        shutdown(this.parentGroup);
         this.childGroup = null;
         this.parentGroup = null;
+        this.pingExecutor = null;
+
+        @Nullable RuntimeException failure = null;
+        if (pingExecutor != null) {
+            failure = cleanup(failure, () -> shutdown(pingExecutor));
+        }
+        failure = disconnectSessions(failure);
+        sessions.clear();
+        failure = cleanup(failure, () -> channel.close().syncUninterruptibly());
+        failure = cleanup(failure, () -> shutdown(childGroup));
+        failure = cleanup(failure, () -> shutdown(parentGroup));
+        if (failure != null) throw failure;
     }
 
-    private void disconnectSessions() {
+    private @Nullable RuntimeException disconnectSessions(@Nullable RuntimeException failure) {
         final List<Channel> peerChannels = new ArrayList<>();
         final List<Future<?>> drainFutures = new ArrayList<>();
         for (BedrockServerSession session : Set.copyOf(sessions)) {
             final Channel peerChannel = session.getPeer().getChannel();
             if (!peerChannel.isActive()) continue;
-            session.disconnect("Server shutting down");
             peerChannels.add(peerChannel);
-            drainFutures.add(peerChannel.eventLoop()
-                    .schedule(peerChannel::flush, SHUTDOWN_DRAIN_MILLIS, TimeUnit.MILLISECONDS));
+            failure = cleanup(failure, () -> session.disconnect("Server shutting down"));
+            try {
+                drainFutures.add(peerChannel.eventLoop()
+                        .schedule(peerChannel::flush, SHUTDOWN_DRAIN_MILLIS, TimeUnit.MILLISECONDS));
+            } catch (RuntimeException exception) {
+                failure = addFailure(failure, exception);
+            }
         }
         for (Future<?> drainFuture : drainFutures) {
-            drainFuture.syncUninterruptibly();
+            failure = cleanup(failure, drainFuture::syncUninterruptibly);
         }
         for (Channel peerChannel : peerChannels) {
-            peerChannel.close().syncUninterruptibly();
+            failure = cleanup(failure, () -> peerChannel.close().syncUninterruptibly());
         }
+        return failure;
+    }
+
+    private static @Nullable RuntimeException cleanup(
+            @Nullable RuntimeException failure, Runnable cleanup) {
+        try {
+            cleanup.run();
+            return failure;
+        } catch (RuntimeException exception) {
+            return addFailure(failure, exception);
+        }
+    }
+
+    private static RuntimeException addFailure(
+            @Nullable RuntimeException failure, RuntimeException exception) {
+        if (failure == null) return exception;
+        failure.addSuppressed(exception);
+        return failure;
     }
 
     /**
@@ -223,10 +265,37 @@ public final class BedrockServer {
         return (InetSocketAddress) channel.localAddress();
     }
 
-    private static void shutdown(EventLoopGroup group) {
+    private static ExecutorService createPingExecutor() {
+        return new ThreadPoolExecutor(
+                0,
+                MAX_CONCURRENT_PINGS,
+                30,
+                TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                Thread.ofVirtual().name("minestom-bedrock-ping-", 0).factory(),
+                new ThreadPoolExecutor.DiscardPolicy());
+    }
+
+    private static void shutdown(@Nullable EventLoopGroup group) {
         if (group != null) {
-            group.shutdownGracefully(0, 5, TimeUnit.SECONDS).syncUninterruptibly();
+            group.shutdownGracefully(0, SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS).syncUninterruptibly();
         }
+    }
+
+    private static void shutdown(ExecutorService executor) {
+        executor.shutdownNow();
+        boolean interrupted = false;
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_TIMEOUT_SECONDS);
+        while (!executor.isTerminated()) {
+            final long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) break;
+            try {
+                executor.awaitTermination(remaining, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException _) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     private static final class Initializer extends BedrockServerInitializer {
@@ -374,7 +443,14 @@ public final class BedrockServer {
 
         @Override
         protected void channelRead0(ChannelHandlerContext context, RakPing ping) {
-            Thread.startVirtualThread(() -> server.respondToPing(context, ping));
+            server.submitPing(context, ping);
+        }
+    }
+
+    private void submitPing(ChannelHandlerContext context, RakPing ping) {
+        final ExecutorService pingExecutor = this.pingExecutor;
+        if (pingExecutor != null) {
+            pingExecutor.execute(() -> respondToPing(context, ping));
         }
     }
 

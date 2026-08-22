@@ -155,8 +155,6 @@ public class BedrockLoginHandshakeTest {
             identityJwt = sign(identityClaims, identityKey);
 
             JwtClaims clientClaims = new JwtClaims();
-            clientClaims.setIssuedAtToNow();
-            clientClaims.setExpirationTimeMinutesInTheFuture(5);
             clientClaims.setClaim(
                     "ThirdPartyName",
                     credentials == Credentials.MISMATCHED_CLIENT_DATA ? "AnotherPlayer" : name);
