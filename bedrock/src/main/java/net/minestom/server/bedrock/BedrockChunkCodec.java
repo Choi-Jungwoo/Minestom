@@ -13,11 +13,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-final class BedrockWorldCodec {
+final class BedrockChunkCodec {
     private static final int SUB_CHUNK_VERSION = 9;
     private static final int[] BITS_PER_ENTRY = {0, 1, 2, 3, 4, 5, 6, 8, 16};
 
-    private BedrockWorldCodec() {
+    private BedrockChunkCodec() {
     }
 
     static LevelChunkPacket encodeChunk(
@@ -43,15 +43,12 @@ final class BedrockWorldCodec {
             }
             data.writeByte(0); // Education Edition border blocks.
 
-            final LevelChunkPacket packet = new LevelChunkPacket();
-            packet.setChunkX(chunk.getChunkX());
-            packet.setChunkZ(chunk.getChunkZ());
-            packet.setSubChunksLength(subChunkCount);
-            packet.setCachingEnabled(false);
-            packet.setRequestSubChunks(false);
-            packet.setDimension(dimensionId);
-            packet.setData(data);
-            return packet;
+            return chunkPacket(
+                    data,
+                    chunk.getChunkX(),
+                    chunk.getChunkZ(),
+                    subChunkCount,
+                    dimensionId);
         } catch (Throwable throwable) {
             data.release();
             throw throwable;
@@ -72,19 +69,28 @@ final class BedrockWorldCodec {
             }
             data.writeByte(0);
 
-            final LevelChunkPacket packet = new LevelChunkPacket();
-            packet.setChunkX(chunkX);
-            packet.setChunkZ(chunkZ);
-            packet.setSubChunksLength(0);
-            packet.setCachingEnabled(false);
-            packet.setRequestSubChunks(false);
-            packet.setDimension(dimensionId);
-            packet.setData(data);
-            return packet;
+            return chunkPacket(data, chunkX, chunkZ, 0, dimensionId);
         } catch (Throwable throwable) {
             data.release();
             throw throwable;
         }
+    }
+
+    private static LevelChunkPacket chunkPacket(
+            ByteBuf data,
+            int chunkX,
+            int chunkZ,
+            int subChunkCount,
+            int dimensionId) {
+        final LevelChunkPacket packet = new LevelChunkPacket();
+        packet.setChunkX(chunkX);
+        packet.setChunkZ(chunkZ);
+        packet.setSubChunksLength(subChunkCount);
+        packet.setCachingEnabled(false);
+        packet.setRequestSubChunks(false);
+        packet.setDimension(dimensionId);
+        packet.setData(data);
+        return packet;
     }
 
     private static int subChunkCount(Chunk chunk) {

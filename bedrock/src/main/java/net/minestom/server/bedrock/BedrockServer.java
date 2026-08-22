@@ -31,11 +31,13 @@ import org.cloudburstmc.protocol.bedrock.BedrockPong;
 import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.data.PacketCompressionAlgorithm;
+import org.cloudburstmc.protocol.bedrock.data.PlayerActionType;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockServerInitializer;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacketHandler;
 import org.cloudburstmc.protocol.bedrock.packet.ClientToServerHandshakePacket;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkSettingsPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
 import org.cloudburstmc.protocol.bedrock.packet.RequestNetworkSettingsPacket;
@@ -520,6 +522,19 @@ public final class BedrockServer {
         }
 
         @Override
+        public PacketSignal handle(PlayerActionPacket packet) {
+            final BedrockConnection connection = this.connection;
+            if (phase != HandshakePhase.ADMITTED || connection == null) {
+                session.disconnect("Bedrock player action received before player admission");
+                return PacketSignal.HANDLED;
+            }
+            if (packet.getAction() == PlayerActionType.DIMENSION_CHANGE_SUCCESS) {
+                connection.handleDimensionChangeSuccess();
+            }
+            return PacketSignal.HANDLED;
+        }
+
+        @Override
         public void onDisconnect(CharSequence reason) {
             server.sessions.remove(session);
             final BedrockConnection connection = this.connection;
@@ -547,7 +562,7 @@ public final class BedrockServer {
                     player.setPendingOptions(server.config.spawningInstance(), false);
                     connection.setClientState(ConnectionState.PLAY);
                     connection.setServerState(ConnectionState.PLAY);
-                    connection.initializeWorld(server.config.spawningInstance());
+                    connection.initializeInstance(server.config.spawningInstance());
                     connection.sendBedrockPacket(BedrockStartGame.create(
                             player,
                             server.config.spawningInstance(),

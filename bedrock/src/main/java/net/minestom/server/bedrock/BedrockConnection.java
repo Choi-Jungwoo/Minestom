@@ -10,6 +10,7 @@ import net.minestom.server.entity.Player;
 import net.minestom.server.instance.Chunk;
 import net.minestom.server.instance.Instance;
 import net.minestom.server.network.packet.client.play.ClientPlayerPositionAndRotationPacket;
+import net.minestom.server.network.packet.client.play.ClientTeleportConfirmPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.packet.server.play.BlockChangePacket;
 import net.minestom.server.network.packet.server.play.MultiBlockChangePacket;
@@ -33,6 +34,7 @@ import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.NetworkChunkPublisherUpdatePacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerActionPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerAuthInputPacket;
+import org.cloudburstmc.protocol.bedrock.packet.PlayStatusPacket;
 import org.cloudburstmc.protocol.bedrock.packet.UpdateBlockPacket;
 import org.jetbrains.annotations.Nullable;
 
@@ -44,6 +46,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A native Bedrock transport connection attached to an ordinary Minestom player.
@@ -52,10 +56,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class BedrockConnection extends PlayerConnection {
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacySection();
-    private static final Component UNSUPPORTED_WORLD =
-            Component.text("Unsupported Bedrock world data");
+    private static final Component UNSUPPORTED_INSTANCE_DATA =
+            Component.text("Unsupported Bedrock instance data");
     private static final Component UNSUPPORTED_MOVEMENT =
             Component.text("Unsupported Bedrock movement capability");
+    private static final float TELEPORT_CONFIRM_TOLERANCE = 0.1f;
+    private static final int TELEPORT_RESEND_INPUTS = 20;
     private static final Set<PlayerAuthInputData> UNSUPPORTED_MOVEMENT_INPUTS = EnumSet.of(
             PlayerAuthInputData.ASCEND,
             PlayerAuthInputData.DESCEND,
@@ -77,6 +83,8 @@ public final class BedrockConnection extends PlayerConnection {
     private final BedrockMappings mappings;
     private final ServerProcess process;
     private final AtomicBoolean disconnected = new AtomicBoolean();
+    private final AtomicInteger pendingDimensionChanges = new AtomicInteger();
+    private final AtomicReference<PendingTeleport> pendingTeleport = new AtomicReference<>();
     private volatile long lastClientTick = -1;
     private volatile @Nullable UUID instanceId;
     private volatile int dimensionId;
@@ -120,7 +128,7 @@ public final class BedrockConnection extends PlayerConnection {
                 sendPosition(position);
             }
         } catch (RuntimeException exception) {
-            failWorld(exception);
+            failInstanceData(exception);
         }
     }
 
@@ -128,14 +136,14 @@ public final class BedrockConnection extends PlayerConnection {
     public void sendChunk(Chunk chunk) {
         if (disconnected.get()) return;
         try {
-            switchWorld(chunk.getInstance());
-            sendBedrockPacket(BedrockWorldCodec.encodeChunk(
+            switchInstance(chunk.getInstance());
+            sendBedrockPacket(BedrockChunkCodec.encodeChunk(
                     session.getPeer().getChannel().alloc(),
                     chunk,
                     mappings,
                     dimensionId));
         } catch (RuntimeException exception) {
-            failWorld(exception);
+            failInstanceData(exception);
         }
     }
 
@@ -162,7 +170,7 @@ public final class BedrockConnection extends PlayerConnection {
         }
     }
 
-    void initializeWorld(Instance instance) {
+    void initializeInstance(Instance instance) {
         instanceId = instance.getUuid();
         dimensionId = BedrockStartGame.dimensionId(instance, process);
     }
@@ -179,6 +187,7 @@ public final class BedrockConnection extends PlayerConnection {
         final long tick = packet.getTick();
         if (tick <= lastClientTick) return;
         lastClientTick = tick;
+        if (handlePendingTeleport(player, packet)) return;
 
         final Vector3f position = packet.getPosition();
         final Vector3f rotation = packet.getRotation();
@@ -192,6 +201,15 @@ public final class BedrockConnection extends PlayerConnection {
                 feetPosition,
                 packet.getInputData().contains(PlayerAuthInputData.VERTICAL_COLLISION),
                 packet.getInputData().contains(PlayerAuthInputData.HORIZONTAL_COLLISION)));
+    }
+
+    void handleDimensionChangeSuccess() {
+        final int previous = pendingDimensionChanges.getAndUpdate(
+                current -> Math.max(0, current - 1));
+        if (previous != 1) return;
+        final PlayStatusPacket status = new PlayStatusPacket();
+        status.setStatus(PlayStatusPacket.Status.PLAYER_SPAWN);
+        sendBedrockPacket(status);
     }
 
     @Override
@@ -237,7 +255,7 @@ public final class BedrockConnection extends PlayerConnection {
     private void sendChunkPublisherUpdate(UpdateViewPositionPacket view) {
         final Player player = getPlayer();
         if (player == null || player.getInstance() == null) return;
-        switchWorld(player.getInstance());
+        switchInstance(player.getInstance());
         final NetworkChunkPublisherUpdatePacket update = new NetworkChunkPublisherUpdatePacket();
         update.setPosition(Vector3i.from(
                 view.chunkX() * Chunk.CHUNK_SIZE_X + Chunk.CHUNK_SIZE_X / 2,
@@ -278,7 +296,7 @@ public final class BedrockConnection extends PlayerConnection {
         final DimensionType dimensionType = Objects.requireNonNull(
                 process.dimensionType().get(instance.getDimensionType()),
                 "Instance dimension type is not registered");
-        sendBedrockPacket(BedrockWorldCodec.encodeEmptyChunk(
+        sendBedrockPacket(BedrockChunkCodec.encodeEmptyChunk(
                 session.getPeer().getChannel().alloc(),
                 chunkX,
                 chunkZ,
@@ -312,16 +330,24 @@ public final class BedrockConnection extends PlayerConnection {
         move.setTeleportationCause(MovePlayerPacket.TeleportationCause.UNKNOWN);
         move.setEntityType(0);
         move.setTick(Math.max(0, lastClientTick));
+        if (packet.teleportId() >= 0) {
+            pendingTeleport.set(new PendingTeleport(
+                    packet.teleportId(),
+                    move,
+                    0));
+        }
         sendBedrockPacket(move);
-        player.refreshReceivedTeleportId(packet.teleportId());
     }
 
-    private void switchWorld(Instance instance) {
+    private void switchInstance(Instance instance) {
         final UUID targetInstanceId = instance.getUuid();
         if (targetInstanceId.equals(instanceId)) return;
         final int targetDimension = BedrockStartGame.dimensionId(instance, process);
         if (targetDimension == dimensionId) {
+            pendingDimensionChanges.set(2);
             sendDimension(targetDimension == 0 ? 1 : 0);
+        } else {
+            pendingDimensionChanges.set(1);
         }
         sendDimension(targetDimension);
         instanceId = targetInstanceId;
@@ -351,15 +377,50 @@ public final class BedrockConnection extends PlayerConnection {
         sendBedrockPacket(complete);
     }
 
+    private boolean handlePendingTeleport(Player player, PlayerAuthInputPacket packet) {
+        final PendingTeleport pending = pendingTeleport.get();
+        if (pending == null) return false;
+        if (pending.canConfirm(packet.getPosition())) {
+            if (pendingTeleport.compareAndSet(pending, null)) {
+                player.addPacketToQueue(new ClientTeleportConfirmPacket(pending.teleportId()));
+            }
+            return true;
+        }
+
+        final int unconfirmedInputs = pending.unconfirmedInputs() + 1;
+        final boolean shouldResend = unconfirmedInputs >= TELEPORT_RESEND_INPUTS;
+        final PendingTeleport updated = new PendingTeleport(
+                pending.teleportId(),
+                pending.packet(),
+                shouldResend ? 0 : unconfirmedInputs);
+        if (pendingTeleport.compareAndSet(pending, updated) && shouldResend) {
+            sendBedrockPacket(pending.packet().clone());
+        }
+        return true;
+    }
+
+    private record PendingTeleport(
+            int teleportId,
+            MovePlayerPacket packet,
+            int unconfirmedInputs
+    ) {
+        private boolean canConfirm(Vector3f actual) {
+            final Vector3f position = packet.getPosition();
+            return Math.abs(position.getX() - actual.getX()) < TELEPORT_CONFIRM_TOLERANCE
+                    && Math.abs(position.getY() - actual.getY()) < TELEPORT_CONFIRM_TOLERANCE
+                    && Math.abs(position.getZ() - actual.getZ()) < TELEPORT_CONFIRM_TOLERANCE;
+        }
+    }
+
     private static void releasePayload(BedrockPacket packet) {
         if (packet instanceof LevelChunkPacket chunk && chunk.getData().refCnt() > 0) {
             chunk.getData().release();
         }
     }
 
-    private void failWorld(RuntimeException exception) {
+    private void failInstanceData(RuntimeException exception) {
         process.exception().handleException(exception);
-        kick(UNSUPPORTED_WORLD);
+        kick(UNSUPPORTED_INSTANCE_DATA);
     }
 
     private void disconnectOnce(Runnable notifyPeer) {

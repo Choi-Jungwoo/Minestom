@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @EnvTest
-public class BedrockWorldCodecIntegrationTest {
+public class BedrockChunkCodecIntegrationTest {
     @Test
     void encodesStructuredChunkSectionsWithoutJavaWireData(Env env) {
         var instance = env.createEmptyInstance();
@@ -19,7 +19,7 @@ public class BedrockWorldCodecIntegrationTest {
         var chunk = instance.loadChunk(2, -3).join();
         instance.setBlock(new Pos(32, minY, -48), Block.STONE);
 
-        var packet = BedrockWorldCodec.encodeChunk(
+        var packet = BedrockChunkCodec.encodeChunk(
                 UnpooledByteBufAllocator.DEFAULT,
                 chunk,
                 BedrockMappings.testing(env.process()),
