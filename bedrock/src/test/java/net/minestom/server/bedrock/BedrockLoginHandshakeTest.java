@@ -182,7 +182,7 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
-    void loopbackPlayerUsesAuthoritativeInstanceWorldAndMovement() throws Exception {
+    void loopbackPlayerUsesAuthoritativeInstanceChunksAndMovement() throws Exception {
         var first = server.spawningInstance();
         first.viewDistance(1);
         first.loadChunk(0, 0).join();
