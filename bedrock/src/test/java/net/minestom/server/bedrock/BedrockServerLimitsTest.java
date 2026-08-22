@@ -1,11 +1,18 @@
 package net.minestom.server.bedrock;
 
+import org.cloudburstmc.netty.channel.raknet.RakConstants;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockServerLimitsTest {
+    @Test
+    void limitsDoNotChangeTheExistingConfigRecordShape() {
+        assertEquals(3, BedrockServerConfig.class.getRecordComponents().length);
+    }
+
     @Test
     void defaultsBoundEveryRequiredNetworkResource() {
         final BedrockServerLimits limits = BedrockServerLimits.defaults();
@@ -40,6 +47,24 @@ public class BedrockServerLimitsTest {
                 defaults.maxPacketBytes(),
                 defaults.maxCompressedBatchBytes(),
                 defaults.maxPacketBytes() - 1,
+                defaults.maxPacketsPerTick(),
+                defaults.maxJwtBytes()));
+        assertThrows(IllegalArgumentException.class, () -> new BedrockServerLimits(
+                defaults.maxConnections(),
+                defaults.maxConnectionAttemptsPerSecond(),
+                RakConstants.MINIMUM_MTU_SIZE - 1,
+                defaults.maxPacketBytes(),
+                defaults.maxCompressedBatchBytes(),
+                defaults.maxDecompressedBatchBytes(),
+                defaults.maxPacketsPerTick(),
+                defaults.maxJwtBytes()));
+        assertThrows(IllegalArgumentException.class, () -> new BedrockServerLimits(
+                defaults.maxConnections(),
+                defaults.maxConnectionAttemptsPerSecond(),
+                RakConstants.MAXIMUM_MTU_SIZE + 1,
+                defaults.maxPacketBytes(),
+                defaults.maxCompressedBatchBytes(),
+                defaults.maxDecompressedBatchBytes(),
                 defaults.maxPacketsPerTick(),
                 defaults.maxJwtBytes()));
     }

@@ -103,6 +103,32 @@ public class BedrockServerLifecycleTest {
         assertFalse(server.isStarted());
     }
 
+    @Test
+    void additiveLimitsOverloadKeepsProcessSingletonConfigurationStable() {
+        process = MinecraftServer.updateProcess();
+        final var address = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        final var config = new BedrockServerConfig(
+                address,
+                process.instance().createInstanceContainer(),
+                mappingsDirectory);
+        final BedrockServerLimits limits = new BedrockServerLimits(
+                8,
+                4,
+                1_200,
+                16_384,
+                32_768,
+                65_536,
+                32,
+                16_384);
+
+        server = BedrockServer.create(process, config, limits);
+
+        assertSame(server, BedrockServer.create(process, config, limits));
+        assertThrows(
+                IllegalStateException.class,
+                () -> BedrockServer.create(process, config, BedrockServerLimits.defaults()));
+    }
+
     private static Set<Long> bedrockEventLoopThreads() {
         return Thread.getAllStackTraces().keySet().stream()
                 .filter(Thread::isAlive)

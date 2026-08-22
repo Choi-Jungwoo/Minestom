@@ -12,7 +12,6 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Future;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
-import net.minestom.server.MinecraftServer;
 import net.minestom.server.ServerProcess;
 import net.minestom.server.entity.Player;
 import net.minestom.server.event.GlobalEventHandler;
@@ -86,6 +85,7 @@ public final class BedrockServer {
     private final ServerProcess process;
     private final GlobalEventHandler eventHandler;
     private final BedrockServerConfig config;
+    private final BedrockServerLimits limits;
     private final @Nullable BedrockMappings preloadedMappings;
     private final BedrockDiagnostics diagnostics = new BedrockDiagnostics();
     private final Set<BedrockServerSession> sessions = ConcurrentHashMap.newKeySet();
@@ -99,10 +99,12 @@ public final class BedrockServer {
     private BedrockServer(
             ServerProcess process,
             BedrockServerConfig config,
+            BedrockServerLimits limits,
             @Nullable BedrockMappings preloadedMappings) {
         this.process = process;
         this.eventHandler = process.eventHandler();
         this.config = config;
+        this.limits = limits;
         this.preloadedMappings = preloadedMappings;
     }
 
@@ -139,7 +141,22 @@ public final class BedrockServer {
      */
     public static synchronized BedrockServer create(
             ServerProcess process, BedrockServerConfig config) {
-        return create(process, config, null);
+        return create(process, config, BedrockServerLimits.defaults());
+    }
+
+    /**
+     * Returns the single configured Bedrock server owned by a Minestom process.
+     *
+     * @param process the owning process
+     * @param config  immutable listener, instance, and mappings settings
+     * @param limits  hard listener and protocol resource limits
+     * @return the process Bedrock server
+     */
+    public static synchronized BedrockServer create(
+            ServerProcess process,
+            BedrockServerConfig config,
+            BedrockServerLimits limits) {
+        return create(process, config, limits, null);
     }
 
     static synchronized BedrockServer createForTesting(
@@ -154,7 +171,7 @@ public final class BedrockServer {
         final BedrockServer existing = INSTANCES.get(process);
         if (existing != null
                 && existing.config.address().equals(address)
-                && existing.config.limits().equals(limits)) {
+                && existing.limits.equals(limits)) {
             return existing;
         }
         return create(
@@ -162,26 +179,28 @@ public final class BedrockServer {
                 new BedrockServerConfig(
                         address,
                         process.instance().createInstanceContainer(),
-                        Path.of("."),
-                        limits),
+                        Path.of(".")),
+                limits,
                 BedrockMappings.testing(process));
     }
 
     private static BedrockServer create(
             ServerProcess process,
             BedrockServerConfig config,
+            BedrockServerLimits limits,
             @Nullable BedrockMappings preloadedMappings) {
         Objects.requireNonNull(process, "process");
         Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(limits, "limits");
         final BedrockServer existing = INSTANCES.get(process);
         if (existing != null) {
-            if (!existing.config.equals(config)) {
+            if (!existing.config.equals(config) || !existing.limits.equals(limits)) {
                 throw new IllegalStateException("A Bedrock server already exists for this process");
             }
             return existing;
         }
 
-        final BedrockServer server = new BedrockServer(process, config, preloadedMappings);
+        final BedrockServer server = new BedrockServer(process, config, limits, preloadedMappings);
         INSTANCES.put(process, server);
         process.scheduler().buildShutdownTask(() -> {
             server.stop();
@@ -225,20 +244,20 @@ public final class BedrockServer {
                     .channelFactory(RakChannelFactory.server(transport.datagramChannel()))
                     .group(parentGroup, childGroup)
                     .option(RakChannelOption.RAK_HANDLE_PING, true)
-                    .option(RakChannelOption.RAK_MAX_CONNECTIONS, config.limits().maxConnections())
-                    .option(RakChannelOption.RAK_MAX_MTU, config.limits().maxMtu())
+                    .option(RakChannelOption.RAK_MAX_CONNECTIONS, limits.maxConnections())
+                    .option(RakChannelOption.RAK_MAX_MTU, limits.maxMtu())
                     .option(
                             RakChannelOption.RAK_THROTTLE,
                             new BedrockConnectionThrottle(
-                                    config.limits().maxConnectionAttemptsPerSecond(),
-                                    config.limits().maxConnections(),
+                                    limits.maxConnectionAttemptsPerSecond(),
+                                    limits.maxConnections(),
                                     diagnostics))
                     .childOption(
                             RakChannelOption.RAK_MAX_SPLIT_QUEUED_BYTES,
-                            config.limits().maxDecompressedBatchBytes())
+                            limits.maxDecompressedBatchBytes())
                     .childOption(
                             RakChannelOption.RAK_MAX_ORDERING_QUEUED_BYTES,
-                            config.limits().maxDecompressedBatchBytes())
+                            limits.maxDecompressedBatchBytes())
                     .childHandler(new Initializer(this))
                     .bind(config.address())
                     .syncUninterruptibly()
@@ -418,7 +437,7 @@ public final class BedrockServer {
             pipeline.addAfter(
                     BedrockBatchDecoder.NAME,
                     BedrockPacketLimit.NAME,
-                    new BedrockPacketLimit(server.config.limits().maxPacketBytes()));
+                    new BedrockPacketLimit(server.limits.maxPacketBytes()));
             pipeline.addLast(new ProtocolExceptionHandler(server, session, handler));
         }
     }
@@ -483,17 +502,17 @@ public final class BedrockServer {
         private HandshakePhase phase = HandshakePhase.INITIAL;
         private @Nullable GameProfile candidateProfile;
         private @Nullable BedrockConnection connection;
-        private long inboundWindow = Long.MIN_VALUE;
-        private int inboundPackets;
+        private final BedrockInboundPacketLimit inboundLimit;
 
         private HandshakeHandler(BedrockServer server, BedrockServerSession session) {
             this.server = server;
             this.session = session;
+            this.inboundLimit = new BedrockInboundPacketLimit(server.limits.maxPacketsPerTick());
         }
 
         @Override
         public PacketSignal handlePacket(BedrockPacket packet) {
-            if (phase == HandshakePhase.ADMITTED && !acceptInboundPacket()) {
+            if (!inboundLimit.accept()) {
                 server.diagnostics.rejection(
                         session.getCodec().getProtocolVersion(),
                         phase.name(),
@@ -503,16 +522,6 @@ public final class BedrockServer {
                 return PacketSignal.HANDLED;
             }
             return BedrockPacketHandler.super.handlePacket(packet);
-        }
-
-        private boolean acceptInboundPacket() {
-            final long window = System.nanoTime()
-                    / TimeUnit.MILLISECONDS.toNanos(MinecraftServer.TICK_MS);
-            if (window != inboundWindow) {
-                inboundWindow = window;
-                inboundPackets = 0;
-            }
-            return ++inboundPackets <= server.config.limits().maxPacketsPerTick();
         }
 
         @Override
@@ -535,7 +544,7 @@ public final class BedrockServer {
             response.setCompressionAlgorithm(PacketCompressionAlgorithm.ZLIB);
             response.setCompressionThreshold(512);
             session.sendPacketImmediately(response);
-            session.getPeer().setCompression(new BedrockCompression(server.config.limits()));
+            session.getPeer().setCompression(new BedrockCompression(server.limits));
             phase = HandshakePhase.NETWORK_SETTINGS;
             return PacketSignal.HANDLED;
         }
@@ -550,7 +559,7 @@ public final class BedrockServer {
 
             try {
                 final BedrockLoginValidator.VerifiedLogin verified =
-                        BedrockLoginValidator.validate(login, server.config.limits());
+                        BedrockLoginValidator.validate(login, server.limits);
                 final UUID uuid = BedrockConnection.offlineUuid(verified.name());
                 candidateProfile = new GameProfile(uuid, verified.name());
                 final Channel peerChannel = session.getPeer().getChannel();

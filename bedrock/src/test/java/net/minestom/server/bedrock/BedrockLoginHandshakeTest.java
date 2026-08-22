@@ -106,11 +106,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -602,6 +604,22 @@ public class BedrockLoginHandshakeTest {
     }
 
     @Test
+    void unansweredKeepAliveUsesCoreTimeoutCleanup() throws Exception {
+        try (var client = new LoginClient(
+                server.boundAddress(), "TimedOut", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            final Player player = awaitPlayer();
+
+            player.refreshKeepAlive(System.nanoTime() - TimeUnit.SECONDS.toNanos(16));
+            tick();
+
+            assertEquals("§cTimeout", client.disconnects.poll(3, TimeUnit.SECONDS));
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+        }
+    }
+
+    @Test
     void kickAndRepeatedDisconnectCleanUpOnceWithTheClientReason() throws Exception {
         final AtomicInteger disconnectEvents = new AtomicInteger();
         process.eventHandler().addListener(PlayerDisconnectEvent.class, _ -> disconnectEvents.incrementAndGet());
@@ -700,7 +718,7 @@ public class BedrockLoginHandshakeTest {
                 1_048_576,
                 2_097_152,
                 8_388_608,
-                2,
+                16,
                 1_048_576));
         try (var client = new LoginClient(
                 server.boundAddress(), "InboundLimit", AuthType.SELF_SIGNED, Credentials.VALID)) {
@@ -708,9 +726,9 @@ public class BedrockLoginHandshakeTest {
             assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
             awaitPlayer();
 
-            client.move(new Pos(0, 42, 0), 1);
-            client.move(new Pos(0, 42, 0), 2);
-            client.move(new Pos(0, 42, 0), 3);
+            for (int tick = 1; tick <= 17; tick++) {
+                client.move(new Pos(0, 42, 0), tick);
+            }
 
             assertEquals(
                     "Bedrock inbound packet limit exceeded",
@@ -742,6 +760,68 @@ public class BedrockLoginHandshakeTest {
             assertEquals(
                     "Bedrock packet exceeds configured limits",
                     client.disconnects.poll(3, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void handshakeLoginAndAdmittedSessionChurnLeavesNoPlayersBehind() throws Exception {
+        for (int index = 0; index < 2; index++) {
+            final LoginClient interrupted = new LoginClient(
+                    server.boundAddress(),
+                    "HandshakeInterrupted" + index,
+                    AuthType.SELF_SIGNED,
+                    Credentials.VALID);
+            // Closing before RequestNetworkSettings simulates interruption during handshake.
+            interrupted.close();
+        }
+
+        for (int index = 0; index < 2; index++) {
+            final LoginClient interrupted = new LoginClient(
+                    server.boundAddress(),
+                    "LoginInterrupted" + index,
+                    AuthType.SELF_SIGNED,
+                    Credentials.VALID);
+            interrupted.sendLogin = false;
+            interrupted.begin();
+            assertTrue(awaitCondition(() ->
+                    interrupted.stage.equals("received network settings")));
+            interrupted.close();
+        }
+
+        for (int index = 0; index < 4; index++) {
+            try (var admitted = new LoginClient(
+                    server.boundAddress(),
+                    "Churn" + index,
+                    AuthType.SELF_SIGNED,
+                    Credentials.VALID)) {
+                admitted.begin();
+                assertTrue(admitted.completed.await(3, TimeUnit.SECONDS), () -> admitted.stage);
+                awaitPlayer();
+            }
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+        }
+    }
+
+    @Test
+    void concurrentClientAndServerCloseDoesNotDuplicateCleanup() throws Exception {
+        final AtomicInteger disconnectEvents = new AtomicInteger();
+        process.eventHandler().addListener(
+                PlayerDisconnectEvent.class, _ -> disconnectEvents.incrementAndGet());
+        try (var client = new LoginClient(
+                server.boundAddress(), "ConcurrentClose", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            client.begin();
+            assertTrue(client.completed.await(3, TimeUnit.SECONDS), () -> client.stage);
+            awaitPlayer();
+
+            final CompletableFuture<Void> clientClose =
+                    CompletableFuture.runAsync(client::close);
+            final CompletableFuture<Void> serverClose =
+                    CompletableFuture.runAsync(server::stop);
+            assertDoesNotThrow(() -> CompletableFuture.allOf(clientClose, serverClose).join());
+
+            assertTrue(tickUntil(() -> process.connection().getOnlinePlayerCount() == 0));
+            tick();
+            assertEquals(1, disconnectEvents.get());
         }
     }
 
@@ -791,6 +871,14 @@ public class BedrockLoginHandshakeTest {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
             tick();
+            Thread.sleep(10);
+        }
+        return condition.getAsBoolean();
+    }
+
+    private static boolean awaitCondition(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
             Thread.sleep(10);
         }
         return condition.getAsBoolean();
@@ -862,6 +950,8 @@ public class BedrockLoginHandshakeTest {
 
         private final BedrockClientSession session;
         private final Channel channel;
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private boolean sendLogin = true;
         private volatile String stage = "connected";
         private volatile PlayStatusPacket.Status playStatus;
         private volatile boolean resourcePacksInfoEmpty;
@@ -1042,6 +1132,10 @@ public class BedrockLoginHandshakeTest {
 
         @Override
         public void close() {
+            if (!closed.compareAndSet(false, true)) return;
+            if (session.isConnected()) {
+                session.disconnect("Test client closed");
+            }
             channel.close().syncUninterruptibly();
             eventLoopGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS).syncUninterruptibly();
         }
@@ -1059,6 +1153,7 @@ public class BedrockLoginHandshakeTest {
             public PacketSignal handle(NetworkSettingsPacket packet) {
                 stage = "received network settings";
                 session.setCompression(packet.getCompressionAlgorithm());
+                if (!sendLogin) return PacketSignal.HANDLED;
                 var login = new LoginPacket();
                 login.setProtocolVersion(1001);
                 login.setAuthPayload(new CertificateChainPayload(List.of(identityJwt), authType));

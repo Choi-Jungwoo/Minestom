@@ -11,7 +11,7 @@ import org.cloudburstmc.netty.channel.raknet.RakConstants;
  * @param maxPacketBytes                 maximum uncompressed Bedrock packet size
  * @param maxCompressedBatchBytes        maximum compressed Bedrock batch size
  * @param maxDecompressedBatchBytes      maximum decompressed Bedrock batch size
- * @param maxPacketsPerTick              maximum admitted packets processed per connection per tick window
+ * @param maxPacketsPerTick              maximum packets processed per connection per tick window
  * @param maxJwtBytes                    maximum combined login JWT size
  */
 public record BedrockServerLimits(
