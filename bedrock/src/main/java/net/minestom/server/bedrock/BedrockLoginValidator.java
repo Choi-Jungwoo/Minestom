@@ -1,8 +1,11 @@
 package net.minestom.server.bedrock;
 
 import org.cloudburstmc.protocol.bedrock.data.auth.AuthType;
+import org.cloudburstmc.protocol.bedrock.data.auth.AuthPayload;
 import org.cloudburstmc.protocol.bedrock.data.auth.CertificateChainPayload;
+import org.cloudburstmc.protocol.bedrock.data.auth.TokenPayload;
 import org.cloudburstmc.protocol.bedrock.packet.LoginPacket;
+import org.cloudburstmc.protocol.bedrock.util.ChainValidationResult;
 import org.cloudburstmc.protocol.bedrock.util.EncryptionUtils;
 import org.jose4j.json.JsonUtil;
 import org.jose4j.jwa.AlgorithmConstraints;
@@ -22,39 +25,26 @@ final class BedrockLoginValidator {
     }
 
     static VerifiedLogin validate(LoginPacket login, BedrockServerLimits limits) throws Exception {
-        final AuthType authType = login.getAuthPayload().getAuthType();
-        if (authType != AuthType.SELF_SIGNED && authType != AuthType.GUEST) {
-            throw new IllegalArgumentException("Only offline login is supported");
-        }
-        if (!(login.getAuthPayload() instanceof CertificateChainPayload chainPayload)
-                || chainPayload.getChain().size() != 1) {
-            throw new IllegalArgumentException("Offline login requires one identity certificate");
-        }
-
-        final String compactIdentityJwt = chainPayload.getChain().getFirst();
+        final AuthPayload authPayload = login.getAuthPayload();
         final String compactClientJwt = login.getClientJwt();
-        final long jwtBytes =
-                (long) utf8Length(compactIdentityJwt) + utf8Length(compactClientJwt);
+        final long jwtBytes = authPayloadBytes(authPayload) + utf8Length(compactClientJwt);
         if (jwtBytes > limits.maxJwtBytes()) {
             throw new IllegalArgumentException("JWT input exceeds the login limit");
         }
-        final JsonWebSignature identityJwt = verifiedJwt(compactIdentityJwt);
-        final Map<String, Object> identityClaims = JsonUtil.parseJson(identityJwt.getUnverifiedPayload());
-        validateTimes(identityClaims);
-        final String identityPublicKey = requiredString(identityClaims, "identityPublicKey");
-        final PublicKey clientKey = EncryptionUtils.parseKey(identityPublicKey);
-        if (!clientKey.equals(identityJwt.getKey())) {
-            throw new IllegalArgumentException("Identity certificate changed its public key");
+
+        final AuthType authType = authPayload.getAuthType();
+        final Identity identity;
+        if (authType == AuthType.FULL) {
+            identity = authenticatedIdentity(authPayload);
+        } else if (authType == AuthType.SELF_SIGNED || authType == AuthType.GUEST) {
+            identity = offlineIdentity(authPayload);
+        } else {
+            throw new IllegalArgumentException("Unsupported Bedrock authentication type");
         }
 
-        final Map<String, Object> extraData = requiredMap(identityClaims, "extraData");
-        final String name = requiredString(extraData, "displayName");
-        if (name.length() > 16) throw new IllegalArgumentException("Bedrock name is too long");
-        UUID.fromString(requiredString(extraData, "identity"));
-        requiredStringAllowEmpty(extraData, "XUID");
-
-        final JsonWebSignature clientJwt = verifiedJwt(compactClientJwt, clientKey);
-        final Map<String, Object> clientData = JsonUtil.parseJson(clientJwt.getUnverifiedPayload());
+        final String name = identity.name();
+        final Map<String, Object> clientData =
+                clientData(compactClientJwt, identity.clientKey());
         // Client-data JWTs inherit trust from the expiring identity certificate and have no time claims.
         if (!name.equals(requiredString(clientData, "ThirdPartyName"))) {
             throw new IllegalArgumentException("Client data name does not match the identity");
@@ -68,7 +58,75 @@ final class BedrockLoginValidator {
             throw new IllegalArgumentException("Client data is not for Bedrock 1.26");
         }
         final BedrockSkin skin = BedrockSkin.classic(clientData, limits);
-        return new VerifiedLogin(clientKey, name, skin);
+        return new VerifiedLogin(identity.clientKey(), name, skin);
+    }
+
+    private static Identity authenticatedIdentity(AuthPayload authPayload) throws Exception {
+        final ChainValidationResult result = EncryptionUtils.validatePayload(authPayload);
+        if (!result.signed()) {
+            throw new IllegalArgumentException("Bedrock identity is not signed by Mojang");
+        }
+        final ChainValidationResult.IdentityClaims claims = result.identityClaims();
+        if (claims.extraData == null) {
+            throw new IllegalArgumentException("Bedrock identity is missing extra data");
+        }
+        final String name = claims.extraData.displayName;
+        validateName(name);
+        return new Identity(claims.parsedIdentityPublicKey(), name);
+    }
+
+    private static Identity offlineIdentity(AuthPayload authPayload) throws Exception {
+        if (!(authPayload instanceof CertificateChainPayload chainPayload)
+                || chainPayload.getChain().size() != 1) {
+            throw new IllegalArgumentException("Offline login requires one identity certificate");
+        }
+
+        final String compactIdentityJwt = chainPayload.getChain().getFirst();
+        final JsonWebSignature identityJwt = verifiedJwt(compactIdentityJwt);
+        final Map<String, Object> identityClaims = JsonUtil.parseJson(identityJwt.getUnverifiedPayload());
+        validateTimes(identityClaims);
+        final String identityPublicKey = requiredString(identityClaims, "identityPublicKey");
+        final PublicKey clientKey = EncryptionUtils.parseKey(identityPublicKey);
+        if (!clientKey.equals(identityJwt.getKey())) {
+            throw new IllegalArgumentException("Identity certificate changed its public key");
+        }
+
+        final Map<String, Object> extraData = requiredMap(identityClaims, "extraData");
+        final String name = requiredString(extraData, "displayName");
+        validateName(name);
+        UUID.fromString(requiredString(extraData, "identity"));
+        requiredStringAllowEmpty(extraData, "XUID");
+        return new Identity(clientKey, name);
+    }
+
+    private static Map<String, Object> clientData(String compactClientJwt, PublicKey clientKey)
+            throws Exception {
+        final JsonWebSignature clientJwt = verifiedJwt(compactClientJwt, clientKey);
+        final Map<String, Object> clientData = JsonUtil.parseJson(clientJwt.getUnverifiedPayload());
+        return clientData;
+    }
+
+    private static long authPayloadBytes(AuthPayload authPayload) {
+        if (authPayload instanceof CertificateChainPayload chainPayload) {
+            long bytes = 0;
+            for (String certificate : chainPayload.getChain()) {
+                bytes = Math.addExact(bytes, utf8Length(certificate));
+            }
+            return bytes;
+        }
+        if (authPayload instanceof TokenPayload tokenPayload) {
+            return utf8Length(tokenPayload.getToken());
+        }
+        throw new IllegalArgumentException("Unsupported Bedrock authentication payload");
+    }
+
+    private static void validateName(String name) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("Bedrock identity has no display name");
+        }
+        if (name.length() > 16) {
+            throw new IllegalArgumentException("Bedrock name is too long");
+        }
     }
 
     private static JsonWebSignature verifiedJwt(String compactJwt) throws Exception {
@@ -147,6 +205,9 @@ final class BedrockLoginValidator {
 
     private static int utf8Length(String value) {
         return value.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private record Identity(PublicKey clientKey, String name) {
     }
 
     record VerifiedLogin(PublicKey clientKey, String name, BedrockSkin skin) {
