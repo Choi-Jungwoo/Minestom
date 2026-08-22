@@ -38,6 +38,12 @@ public enum ServerListPingType {
     LEGACY_UNVERSIONED(data -> getLegacyPingResponse(data, false)),
 
     /**
+     * A Bedrock Edition server-list discovery response.
+     * The Bedrock module maps the shared {@link Status} to the wire-level pong.
+     */
+    BEDROCK(ServerListPingType::getBedrockPingResponse),
+
+    /**
      * The ping that is sent when {@link OpenToLAN} is enabled and sending packets.
      * Only the description formatted as a legacy string is sent.
      * Ping events with this ping version are <b>not</b> cancellable.
@@ -61,6 +67,10 @@ public enum ServerListPingType {
     }
 
     private static final LegacyComponentSerializer SECTION = LegacyComponentSerializer.legacySection();
+
+    private static String getBedrockPingResponse(Status status) {
+        return SECTION.serialize(status.description());
+    }
 
     /**
      * Creates a ping sent when the server is sending {@link OpenToLAN} packets.

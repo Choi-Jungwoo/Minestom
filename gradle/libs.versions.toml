@@ -7,6 +7,11 @@ data = "26.2-rv3"
 adventure = "5.2.0"
 jetbrainsAnnotations = "26.1.0"
 slf4j = "2.0.18"
+cloudburstConnection = "3.0.0.Beta13-20260814.192942-15"
+cloudburstCommon = "3.0.0.Beta13-20260814.192942-15"
+cloudburstCodec = "3.0.0.Beta13-20260820.124150-16"
+cloudburstRaknet = "1.1.0.CR1-20260820.174333-6"
+netty = "4.2.7.Final"
 
 # Performance / Data Structures
 fastutil = "8.5.19"
@@ -50,6 +55,14 @@ adventure-text-logger-slf4j = { group = "net.kyori", name = "adventure-text-logg
 minestomData = { group = "net.minestom", name = "data", version.ref = "data" }
 jetbrainsAnnotations = { group = "org.jetbrains", name = "annotations", version.ref = "jetbrainsAnnotations" }
 slf4j = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+cloudburst-connection = { group = "org.cloudburstmc.protocol", name = "bedrock-connection", version.ref = "cloudburstConnection" }
+cloudburst-common = { group = "org.cloudburstmc.protocol", name = "common", version.ref = "cloudburstCommon" }
+cloudburst-codec = { group = "org.cloudburstmc.protocol", name = "bedrock-codec", version.ref = "cloudburstCodec" }
+cloudburst-raknet = { group = "org.cloudburstmc.netty", name = "netty-transport-raknet", version.ref = "cloudburstRaknet" }
+netty-bom = { group = "io.netty", name = "netty-bom", version.ref = "netty" }
+netty-codec = { group = "io.netty", name = "netty-codec", version.ref = "netty" }
+netty-handler = { group = "io.netty", name = "netty-handler", version.ref = "netty" }
+netty-transport = { group = "io.netty", name = "netty-transport", version.ref = "netty" }
 
 # Performance / Data Structures
 fastutil = { group = "it.unimi.dsi", name = "fastutil", version.ref = "fastutil" }

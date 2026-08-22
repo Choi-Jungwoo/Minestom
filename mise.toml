@@ -1,0 +1,24 @@
+[tools]
+java = "oracle-graalvm-25.0.4"
+gradle = "9.7.0"
+
+[tasks.build]
+run = "gradle build"
+
+[tasks.check]
+run = "gradle check"
+
+[tasks.test]
+run = "gradle test"
+
+[tasks.bedrock-compile]
+run = "gradle :bedrock:compileJava :bedrock:compileTestJava"
+
+[tasks.bedrock-test]
+run = "gradle :bedrock:test"
+
+[tasks.bedrock-check]
+run = "gradle :bedrock:check"
+
+[tasks.bedrock-dependencies]
+run = "gradle :bedrock:dependencies --configuration runtimeClasspath"
