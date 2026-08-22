@@ -49,7 +49,6 @@ import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataTypes;
 import org.cloudburstmc.protocol.bedrock.data.entity.EntityFlag;
 import org.cloudburstmc.protocol.bedrock.data.inventory.ContainerId;
 import org.cloudburstmc.protocol.bedrock.data.inventory.ItemData;
-import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
 import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
 import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
@@ -116,6 +115,7 @@ public final class BedrockConnection extends PlayerConnection {
     private final InetSocketAddress serverAddress;
     private final BedrockMappings mappings;
     private final ServerProcess process;
+    private final BedrockSkin displaySkin;
     private final Map<Integer, UUID> visiblePlayerUuids = new ConcurrentHashMap<>();
     private final AtomicBoolean disconnected = new AtomicBoolean();
     private final AtomicInteger pendingDimensionChanges = new AtomicInteger();
@@ -129,12 +129,14 @@ public final class BedrockConnection extends PlayerConnection {
             InetSocketAddress remoteAddress,
             InetSocketAddress serverAddress,
             BedrockMappings mappings,
-            ServerProcess process) {
+            ServerProcess process,
+            BedrockSkin displaySkin) {
         this.session = Objects.requireNonNull(session, "session");
         this.remoteAddress = Objects.requireNonNull(remoteAddress, "remoteAddress");
         this.serverAddress = Objects.requireNonNull(serverAddress, "serverAddress");
         this.mappings = Objects.requireNonNull(mappings, "mappings");
         this.process = Objects.requireNonNull(process, "process");
+        this.displaySkin = Objects.requireNonNull(displaySkin, "displaySkin");
     }
 
     static UUID offlineUuid(String name) {
@@ -401,14 +403,15 @@ public final class BedrockConnection extends PlayerConnection {
         final PlayerListPacket list = new PlayerListPacket();
         list.setAction(PlayerListPacket.Action.ADD);
         for (PlayerInfoUpdatePacket.Entry player : packet.entries()) {
+            final Player visiblePlayer = findPlayer(player.uuid());
             final PlayerListPacket.Entry entry = new PlayerListPacket.Entry(player.uuid());
             entry.setAction(PlayerListPacket.Action.ADD);
-            entry.setEntityId(findPlayerEntityId(player.uuid()));
+            entry.setEntityId(visiblePlayer == null ? 0 : visiblePlayer.getEntityId());
             entry.setName(player.username());
             entry.setXuid("");
             entry.setPlatformChatId("");
             entry.setBuildPlatform(BuildPlatform.UNKNOWN);
-            entry.setSkin(fallbackSkin(player.uuid()));
+            entry.setSkin(displaySkin(visiblePlayer, player.uuid()));
             entry.setColor(new Color(0, true));
             list.getEntries().add(entry);
         }
@@ -562,11 +565,6 @@ public final class BedrockConnection extends PlayerConnection {
         return metadata;
     }
 
-    private long findPlayerEntityId(UUID uuid) {
-        final Player player = findPlayer(uuid);
-        return player == null ? 0 : player.getEntityId();
-    }
-
     private @Nullable Player findPlayer(UUID uuid) {
         return process.connection().getOnlinePlayers().stream()
                 .filter(player -> player.getUuid().equals(uuid))
@@ -581,22 +579,11 @@ public final class BedrockConnection extends PlayerConnection {
         return instance.getEntityById(entityId) instanceof Player found ? found : null;
     }
 
-    private static SerializedSkin fallbackSkin(UUID uuid) {
-        final byte[] pixels = new byte[64 * 64 * 4];
-        for (int pixel = 0; pixel < pixels.length; pixel += 4) {
-            pixels[pixel] = (byte) 0x42;
-            pixels[pixel + 1] = (byte) 0x81;
-            pixels[pixel + 2] = (byte) 0xA4;
-            pixels[pixel + 3] = (byte) 0xFF;
+    private static SerializedSkin displaySkin(@Nullable Player player, UUID uuid) {
+        if (player != null && player.getPlayerConnection() instanceof BedrockConnection connection) {
+            return connection.displaySkin.serialized();
         }
-        return SerializedSkin.of(
-                "minestom-fallback-" + uuid,
-                "",
-                ImageData.of(64, 64, pixels),
-                ImageData.EMPTY,
-                "geometry.humanoid.custom",
-                "",
-                false);
+        return BedrockSkin.generated(uuid).serialized();
     }
 
     private void switchInstance(Instance instance) {

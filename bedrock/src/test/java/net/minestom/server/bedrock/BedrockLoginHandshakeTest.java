@@ -21,7 +21,10 @@ import net.minestom.server.event.player.PlayerMoveEvent;
 import net.minestom.server.instance.block.Block;
 import net.minestom.server.item.ItemStack;
 import net.minestom.server.item.Material;
+import net.minestom.server.network.PlayerAdmission;
+import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.player.GameProfile;
+import net.minestom.server.network.player.PlayerConnection;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.math.vector.Vector3i;
@@ -81,13 +84,16 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.security.KeyPair;
-import java.util.Base64;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -101,6 +107,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BedrockLoginHandshakeTest {
+    private static final byte[] CLASSIC_SKIN = classicSkin(64, 64);
+
     private ServerProcess process;
     private BedrockServer server;
 
@@ -195,6 +203,16 @@ public class BedrockLoginHandshakeTest {
     @Test
     void rejectsClientDataThatDoesNotMatchTheIdentityWithoutLeakingTheCause() throws Exception {
         assertLoginRejected(Credentials.MISMATCHED_CLIENT_DATA);
+    }
+
+    @Test
+    void rejectsPersonaSkin() throws Exception {
+        assertLoginRejected(Credentials.PERSONA_SKIN);
+    }
+
+    @Test
+    void rejectsOversizedSkin() throws Exception {
+        assertLoginRejected(Credentials.OVERSIZED_SKIN);
     }
 
     @Test
@@ -299,6 +317,76 @@ public class BedrockLoginHandshakeTest {
                     .anyMatch(packet ->
                             packet.getRuntimeEntityId() == visiblePlayer.getEntityId()
                                     && packet.getUuid().equals(visiblePlayer.getUuid()))));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void bedrockClassicSkinPropagatesToObservers() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID);
+             var visible = new LoginClient(
+                     server.boundAddress(), "Visible", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            visible.begin();
+            assertTrue(visible.completed.await(3, TimeUnit.SECONDS), () -> visible.stage);
+            Player visiblePlayer = awaitPlayer("Visible");
+
+            assertTrue(tickUntil(() -> observer.playerLists.stream()
+                    .filter(packet -> packet.getAction() == PlayerListPacket.Action.ADD)
+                    .flatMap(packet -> packet.getEntries().stream())
+                    .filter(entry -> entry.getUuid().equals(visiblePlayer.getUuid()))
+                    .map(PlayerListPacket.Entry::getSkin)
+                    .anyMatch(skin -> skin.getSkinId().equals("test-classic")
+                            && skin.getSkinData().getWidth() == 64
+                            && skin.getSkinData().getHeight() == 64
+                            && Arrays.equals(
+                                    skin.getSkinData().getImage(), CLASSIC_SKIN))));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void javaPlayerUsesGeneratedWideSkinWithRecordedSource() throws Exception {
+        try (var observer = new LoginClient(
+                server.boundAddress(), "Observer", AuthType.SELF_SIGNED, Credentials.VALID)) {
+            observer.begin();
+            assertTrue(observer.completed.await(3, TimeUnit.SECONDS), () -> observer.stage);
+            awaitPlayer("Observer");
+
+            final UUID javaUuid = UUID.randomUUID();
+            final var admission = process.connection().admitPlayer(
+                    new RecordingJavaConnection(),
+                    new GameProfile(javaUuid, "JavaPlayer"),
+                    new PlayerAdmission() {
+                        @Override
+                        public CompletableFuture<Void> accept(GameProfile gameProfile) {
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        @Override
+                        public CompletableFuture<Void> prepare(Player player) {
+                            player.setPendingOptions(server.spawningInstance(), false);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                    });
+            assertTrue(tickUntil(admission::isDone));
+            final Player javaPlayer = admission.join();
+
+            assertTrue(tickUntil(() -> observer.playerLists.stream()
+                    .filter(packet -> packet.getAction() == PlayerListPacket.Action.ADD)
+                    .flatMap(packet -> packet.getEntries().stream())
+                    .filter(entry -> entry.getUuid().equals(javaUuid))
+                    .map(PlayerListPacket.Entry::getSkin)
+                    .anyMatch(skin -> skin.getSkinId().startsWith("minestom-generated:")
+                            && skin.getSkinData().getWidth() == 64
+                            && skin.getSkinData().getHeight() == 64
+                            && skin.getArmSize().equals("wide")
+                            && hasMultipleColors(skin.getSkinData().getImage()))));
+            javaPlayer.remove();
         }
     }
 
@@ -482,6 +570,29 @@ public class BedrockLoginHandshakeTest {
         process.ticker().tick(System.nanoTime());
     }
 
+    private static byte[] classicSkin(int width, int height) {
+        final byte[] pixels = new byte[width * height * 4];
+        for (int index = 0; index < pixels.length; index += 4) {
+            pixels[index] = (byte) 0x7D;
+            pixels[index + 1] = (byte) 0x32;
+            pixels[index + 2] = (byte) 0xA8;
+            pixels[index + 3] = (byte) 0xFF;
+        }
+        return pixels;
+    }
+
+    private static boolean hasMultipleColors(byte[] pixels) {
+        for (int index = 4; index < pixels.length; index += 4) {
+            if (pixels[index] != pixels[0]
+                    || pixels[index + 1] != pixels[1]
+                    || pixels[index + 2] != pixels[2]
+                    || pixels[index + 3] != pixels[3]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static MovePlayerPacket awaitMove(LoginClient client) throws InterruptedException {
         MovePlayerPacket packet = client.moves.poll(3, TimeUnit.SECONDS);
         assertTrue(packet != null);
@@ -492,7 +603,20 @@ public class BedrockLoginHandshakeTest {
         VALID,
         EXPIRED_IDENTITY,
         INVALID_CLIENT_SIGNATURE,
-        MISMATCHED_CLIENT_DATA
+        MISMATCHED_CLIENT_DATA,
+        PERSONA_SKIN,
+        OVERSIZED_SKIN
+    }
+
+    private static final class RecordingJavaConnection extends PlayerConnection {
+        @Override
+        public void sendPacket(SendablePacket packet) {
+        }
+
+        @Override
+        public SocketAddress getRemoteAddress() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565);
+        }
     }
 
     private static final class LoginClient implements AutoCloseable {
@@ -544,6 +668,16 @@ public class BedrockLoginHandshakeTest {
             clientClaims.setClaim("DeviceOS", 7);
             clientClaims.setClaim("DeviceId", UUID.randomUUID().toString());
             clientClaims.setClaim("GameVersion", "1.26.30");
+            final int skinSize = credentials == Credentials.OVERSIZED_SKIN ? 128 : 64;
+            clientClaims.setClaim("SkinId", "test-classic");
+            clientClaims.setClaim("SkinImageWidth", skinSize);
+            clientClaims.setClaim("SkinImageHeight", skinSize);
+            clientClaims.setClaim(
+                    "SkinData",
+                    Base64.getEncoder().encodeToString(
+                            skinSize == 64 ? CLASSIC_SKIN : classicSkin(skinSize, skinSize)));
+            clientClaims.setClaim("PersonaSkin", credentials == Credentials.PERSONA_SKIN);
+            clientClaims.setClaim("ArmSize", "wide");
             clientJwt = sign(
                     clientClaims,
                     credentials == Credentials.INVALID_CLIENT_SIGNATURE

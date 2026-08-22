@@ -16,6 +16,8 @@ import java.util.UUID;
 
 final class BedrockLoginValidator {
     private static final long CLOCK_SKEW_SECONDS = 60;
+    private static final int MAX_IDENTITY_JWT_LENGTH = 16 * 1024;
+    private static final int MAX_CLIENT_JWT_LENGTH = 32 * 1024;
 
     private BedrockLoginValidator() {
     }
@@ -30,7 +32,9 @@ final class BedrockLoginValidator {
             throw new IllegalArgumentException("Offline login requires one identity certificate");
         }
 
-        final JsonWebSignature identityJwt = verifiedJwt(chainPayload.getChain().getFirst());
+        final String compactIdentityJwt = chainPayload.getChain().getFirst();
+        requireLength(compactIdentityJwt, MAX_IDENTITY_JWT_LENGTH, "Identity JWT");
+        final JsonWebSignature identityJwt = verifiedJwt(compactIdentityJwt);
         final Map<String, Object> identityClaims = JsonUtil.parseJson(identityJwt.getUnverifiedPayload());
         validateTimes(identityClaims);
         final String identityPublicKey = requiredString(identityClaims, "identityPublicKey");
@@ -45,7 +49,9 @@ final class BedrockLoginValidator {
         UUID.fromString(requiredString(extraData, "identity"));
         requiredStringAllowEmpty(extraData, "XUID");
 
-        final JsonWebSignature clientJwt = verifiedJwt(login.getClientJwt(), clientKey);
+        final String compactClientJwt = login.getClientJwt();
+        requireLength(compactClientJwt, MAX_CLIENT_JWT_LENGTH, "Client-data JWT");
+        final JsonWebSignature clientJwt = verifiedJwt(compactClientJwt, clientKey);
         final Map<String, Object> clientData = JsonUtil.parseJson(clientJwt.getUnverifiedPayload());
         // Client-data JWTs inherit trust from the expiring identity certificate and have no time claims.
         if (!name.equals(requiredString(clientData, "ThirdPartyName"))) {
@@ -59,7 +65,8 @@ final class BedrockLoginValidator {
         if (!gameVersion.startsWith("1.26.")) {
             throw new IllegalArgumentException("Client data is not for Bedrock 1.26");
         }
-        return new VerifiedLogin(clientKey, name);
+        final BedrockSkin skin = BedrockSkin.classic(clientData);
+        return new VerifiedLogin(clientKey, name, skin);
     }
 
     private static JsonWebSignature verifiedJwt(String compactJwt) throws Exception {
@@ -136,6 +143,12 @@ final class BedrockLoginValidator {
         return result;
     }
 
-    record VerifiedLogin(PublicKey clientKey, String name) {
+    private static void requireLength(String value, int maximum, String description) {
+        if (value.length() > maximum) {
+            throw new IllegalArgumentException(description + " exceeds the login limit");
+        }
+    }
+
+    record VerifiedLogin(PublicKey clientKey, String name, BedrockSkin skin) {
     }
 }

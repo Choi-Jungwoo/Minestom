@@ -432,7 +432,8 @@ public final class BedrockServer {
                         (InetSocketAddress) peerChannel.remoteAddress(),
                         (InetSocketAddress) peerChannel.localAddress(),
                         Objects.requireNonNull(server.mappings, "Bedrock mappings were not loaded"),
-                        server.process);
+                        server.process,
+                        verified.skin());
                 final KeyPair serverKeyPair = EncryptionUtils.createKeyPair();
                 final byte[] token = EncryptionUtils.generateRandomToken();
                 final ServerToClientHandshakePacket handshake = new ServerToClientHandshakePacket();
