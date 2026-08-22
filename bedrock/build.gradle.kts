@@ -4,6 +4,18 @@ plugins {
     id("minestom.java-library")
 }
 
+val example = sourceSets.create("example") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+configurations.named(example.implementationConfigurationName) {
+    extendsFrom(configurations.implementation.get())
+}
+configurations.named(example.runtimeOnlyConfigurationName) {
+    extendsFrom(configurations.runtimeOnly.get())
+}
+
 // Cloudburst's split fastutil artifacts are not JPMS-safe, so this stays an automatic module.
 repositories {
     maven("https://repo.opencollab.dev/main")
@@ -90,6 +102,7 @@ val acceptanceTest = tasks.register<Test>("acceptanceTest") {
 
 tasks.check {
     dependsOn(acceptanceTest)
+    dependsOn(tasks.named(example.classesTaskName))
 }
 
 val bedrockMappingsDirectory = providers.gradleProperty("bedrockMappingsDirectory")
@@ -113,7 +126,7 @@ tasks.register<JavaExec>("updateCompatibilityPins") {
     )
 }
 
-tasks.register<JavaExec>("verifyMappings") {
+val verifyMappings = tasks.register<JavaExec>("verifyMappings") {
     group = "verification"
     description = "Verifies an operator-provided Bedrock mapping directory."
     notCompatibleWithConfigurationCache("The mapping path is supplied at execution time.")
@@ -122,6 +135,19 @@ tasks.register<JavaExec>("verifyMappings") {
     inputs.property("bedrockMappingsDirectory", bedrockMappingsDirectory)
     argumentProviders.add(CommandLineArgumentProvider {
         listOf("verify", bedrockMappingsDirectory.get())
+    })
+}
+
+tasks.register<JavaExec>("runExample") {
+    group = "application"
+    description = "Runs the Bedrock mobile-client example on UDP port 19132."
+    dependsOn(verifyMappings)
+    notCompatibleWithConfigurationCache("The mapping path is supplied at execution time.")
+    classpath = example.runtimeClasspath
+    mainClass.set("net.minestom.server.bedrock.example.BedrockServerExample")
+    jvmArgs("-ea")
+    argumentProviders.add(CommandLineArgumentProvider {
+        listOf(bedrockMappingsDirectory.get())
     })
 }
 

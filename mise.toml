@@ -30,6 +30,11 @@ run = "gradle :bedrock:dependencies --configuration runtimeClasspath"
 description = "Run the real UDP Bedrock acceptance suite"
 run = "gradle :bedrock:acceptanceTest"
 
+[tasks.bedrock-example]
+description = "Run the Bedrock mobile-client example on UDP port 19132"
+usage = 'arg "<mappings>" help="Verified Bedrock mappings directory"'
+run = 'gradle :bedrock:runExample "-PbedrockMappingsDirectory=${usage_mappings?}"'
+
 [tasks.bedrock-compatibility]
 description = "Report immutable Bedrock compatibility pins"
 run = "gradle :bedrock:compatibilityReport"
