@@ -9,6 +9,7 @@ import net.minestom.server.entity.Player;
 import net.minestom.server.event.EventDispatcher;
 import net.minestom.server.event.player.OutgoingTransferEvent;
 import net.minestom.server.event.player.PlayerDisconnectEvent;
+import net.minestom.server.instance.Chunk;
 import net.minestom.server.monitoring.EventsJFR;
 import net.minestom.server.network.ConnectionState;
 import net.minestom.server.network.packet.server.SendablePacket;
@@ -37,7 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * It can be extended to create a new kind of player (NPC for instance).
  */
 public abstract class PlayerConnection {
-    private Player player;
+    private @Nullable Player player;
 
     // Server & client states can differ during configuration.
     // "server" state means the state the server thinks its in.
@@ -82,6 +83,18 @@ public abstract class PlayerConnection {
      * @param packet the packet to send
      */
     public abstract void sendPacket(SendablePacket packet);
+
+    /**
+     * Sends a structured chunk to the client.
+     *
+     * <p>The default implementation retains the Java protocol's existing full chunk packet.
+     * Protocol-specific connections may override this method to encode the chunk directly.
+     *
+     * @param chunk the chunk to send
+     */
+    public void sendChunk(Chunk chunk) {
+        sendPacket(chunk.getFullDataPacket());
+    }
 
     public void sendPackets(Collection<SendablePacket> packets) {
         packets.forEach(this::sendPacket);
@@ -153,9 +166,10 @@ public abstract class PlayerConnection {
      */
     public void disconnect() {
         this.online = false;
-        final Player player = MinecraftServer.getConnectionManager().getPlayer(this);
+        final var connectionManager = MinecraftServer.getConnectionManager();
+        final Player player = connectionManager.getPlayer(this);
         if (player != null) {
-            MinecraftServer.getConnectionManager().removePlayer(this);
+            connectionManager.removePlayer(this);
             if (serverState == ConnectionState.PLAY && !player.isRemoved())
                 player.scheduleNextTick(Entity::remove);
             else {
@@ -163,6 +177,7 @@ public abstract class PlayerConnection {
                 EventsJFR.newPlayerLeave(player.getUuid()).commit();
             }
         }
+        connectionManager.cancelPlayerAdmission(this);
     }
 
     /**
@@ -179,9 +194,9 @@ public abstract class PlayerConnection {
      * <p>
      * WARNING: unsafe.
      *
-     * @param player the player
+     * @param player the player, or {@code null} to clear it
      */
-    public void setPlayer(Player player) {
+    public void setPlayer(@Nullable Player player) {
         this.player = player;
     }
 

@@ -14,6 +14,7 @@ import net.minestom.server.network.ConnectionState;
 import net.minestom.server.network.packet.server.CachedPacket;
 import net.minestom.server.network.packet.server.SendablePacket;
 import net.minestom.server.network.packet.server.ServerPacket;
+import net.minestom.server.network.player.PlayerSocketConnection;
 
 import java.util.Collection;
 import java.util.List;
@@ -67,7 +68,9 @@ public final class PacketSendingUtils {
                                          Predicate<? super T> predicate) {
         final SendablePacket sendablePacket = groupedPacket(packet);
         players.forEach(player -> {
-            if (predicate.test(player)) player.sendPacket(sendablePacket);
+            if (predicate.test(player)) {
+                player.sendPacket(groupedPacket(player, packet, sendablePacket));
+            }
         });
     }
 
@@ -79,7 +82,7 @@ public final class PacketSendingUtils {
      */
     public static void sendGroupedPacket(Collection<? extends Player> players, ServerPacket packet) {
         final SendablePacket sendablePacket = groupedPacket(packet);
-        players.forEach(player -> player.sendPacket(sendablePacket));
+        players.forEach(player -> player.sendPacket(groupedPacket(player, packet, sendablePacket)));
     }
 
     public static void broadcastPlayPacket(ServerPacket packet) {
@@ -88,6 +91,11 @@ public final class PacketSendingUtils {
 
     private static SendablePacket groupedPacket(ServerPacket packet) {
         return ServerFlag.GROUPED_PACKET && shouldUseCachePacket(packet) ? new CachedPacket(packet) : packet;
+    }
+
+    private static SendablePacket groupedPacket(Player player, ServerPacket packet,
+                                                SendablePacket groupedPacket) {
+        return player.getPlayerConnection() instanceof PlayerSocketConnection ? groupedPacket : packet;
     }
 
     /**

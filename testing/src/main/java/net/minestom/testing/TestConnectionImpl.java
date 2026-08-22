@@ -139,7 +139,7 @@ final class TestConnectionImpl implements TestConnection {
         @Override
         public void sendChunk(Chunk chunk) {
             // Send immediately
-            sendPacket(chunk.getFullDataPacket());
+            getPlayerConnection().sendChunk(chunk);
         }
     }
 }

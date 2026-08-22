@@ -20,6 +20,8 @@ public final class ServerFlag {
     public static final int DISPATCHER_THREADS = intProperty("minestom.dispatcher-threads", 1);
     public static final int SEND_LIGHT_AFTER_BLOCK_PLACEMENT_DELAY = intProperty("minestom.send-light-after-block-placement-delay", 100);
     public static final long LOGIN_PLUGIN_MESSAGE_TIMEOUT = longProperty("minestom.login-plugin-message-timeout", 5_000); // 5s
+    public static final long PLAYER_ADMISSION_TIMEOUT =
+            longProperty("minestom.player-admission-timeout", 5 * 60_000); // 5m
     public static final long KNOWN_PACKS_RESPONSE_TIMEOUT = longProperty("minestom.known-packs-response-timeout", 5 * 60_000); // 5m
     public static final boolean ACCEPT_TRANSFERS = booleanProperty("minestom.accept-transfers", false);
     public static final boolean AUTOMATIC_COMPONENT_TRANSLATION = booleanProperty("minestom.automatic-component-translation", false);

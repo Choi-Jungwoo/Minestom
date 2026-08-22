@@ -11,6 +11,9 @@ run = "gradle check"
 [tasks.test]
 run = "gradle test"
 
+[tasks.test-core]
+run = "gradle :test"
+
 [tasks.bedrock-compile]
 run = "gradle :bedrock:compileJava :bedrock:compileTestJava"
 

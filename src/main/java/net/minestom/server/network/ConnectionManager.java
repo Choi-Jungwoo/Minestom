@@ -42,12 +42,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 /**
@@ -57,6 +59,7 @@ public final class ConnectionManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(ConnectionManager.class);
 
     private static final Component TIMEOUT_TEXT = Component.text("Timeout", NamedTextColor.RED);
+    private static final Component ADMISSION_FAILED_TEXT = Component.text("Error during login!", NamedTextColor.RED);
     private static final Component SHUTDOWN_TEXT = Component.text("Server shutting down");
 
     private final CachedPacket cachedTagsPacket =
@@ -64,6 +67,9 @@ public final class ConnectionManager {
 
     // All players once their Player object has been instantiated.
     private final Map<PlayerConnection, Player> connectionPlayerMap = new ConcurrentHashMap<>();
+    // Connections currently moving through the protocol-neutral admission lifecycle.
+    private final Map<PlayerConnection, AdmissionState> playerAdmissions = new ConcurrentHashMap<>();
+    private volatile boolean acceptingAdmissions = true;
     // Players waiting to be spawned (post configuration state)
     private final MessagePassingQueue<Player> playWaitingPlayers = ConcurrentMessageQueues.mpscUnboundedArrayQueue(64);
     // Players waiting to be (re) configured
@@ -188,9 +194,166 @@ public final class ConnectionManager {
     @ApiStatus.Internal
     public Player createPlayer(PlayerConnection connection, GameProfile gameProfile) {
         assert ServerFlag.INSIDE_TEST || Thread.currentThread().isVirtual();
-        final Player player = playerProvider.createPlayer(connection, gameProfile);
+        final Player player = Objects.requireNonNull(
+                playerProvider.createPlayer(connection, gameProfile), "PlayerProvider returned null");
         this.connectionPlayerMap.put(connection, player);
         return player;
+    }
+
+    /**
+     * Admits a candidate connection through the shared player lifecycle.
+     *
+     * <p>Only one admission may be active for a connection. The final profile is accepted by the
+     * adapter before the player provider is invoked, and protocol preparation runs only after the
+     * created player has been registered. Any failure rolls back the player registration.
+     *
+     * @param connection  the candidate connection
+     * @param gameProfile the candidate profile
+     * @param admission   the protocol adapter
+     * @return a future completed with the admitted player
+     */
+    @ApiStatus.Experimental
+    public CompletableFuture<Player> admitPlayer(PlayerConnection connection, GameProfile gameProfile,
+                                                  PlayerAdmission admission) {
+        return admitPlayer(connection, gameProfile, admission,
+                ServerFlag.PLAYER_ADMISSION_TIMEOUT, TimeUnit.MILLISECONDS);
+    }
+
+    CompletableFuture<Player> admitPlayer(PlayerConnection connection, GameProfile gameProfile,
+                                           PlayerAdmission admission, long timeout, TimeUnit unit) {
+        Objects.requireNonNull(connection, "connection");
+        Objects.requireNonNull(gameProfile, "gameProfile");
+        Objects.requireNonNull(admission, "admission");
+        Objects.requireNonNull(unit, "unit");
+        if (timeout <= 0) throw new IllegalArgumentException("timeout must be positive");
+        if (!acceptingAdmissions) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Player admissions are shutting down"));
+        }
+        if (connectionPlayerMap.containsKey(connection)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Connection already has an admitted player"));
+        }
+
+        final AdmissionState state = new AdmissionState(connection);
+        if (playerAdmissions.putIfAbsent(connection, state) != null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Connection admission is already in progress"));
+        }
+        var _ = state.operation.whenComplete((player, throwable) -> {
+            state.cancelPhase();
+            if (throwable != null) {
+                final Throwable rollbackFailure = rollbackAdmission(connection);
+                if (rollbackFailure != null && rollbackFailure != throwable) {
+                    throwable.addSuppressed(rollbackFailure);
+                }
+            }
+            playerAdmissions.remove(connection, state);
+            if (throwable == null) {
+                state.result.complete(player);
+            } else {
+                state.result.completeExceptionally(throwable);
+            }
+        });
+        if (!acceptingAdmissions) {
+            state.operation.cancel(true);
+            return state.result;
+        }
+        Thread.startVirtualThread(() -> runAdmission(
+                state, gameProfile, admission, timeout, unit));
+        return state.result;
+    }
+
+    private void runAdmission(AdmissionState state, GameProfile candidateProfile,
+                              PlayerAdmission admission, long timeout, TimeUnit unit) {
+        try {
+            if (state.operation.isDone()) return;
+            final GameProfile finalProfile = finalGameProfile(state.connection, candidateProfile);
+            if (finalProfile == null) {
+                throw new CancellationException("Connection closed during pre-login");
+            }
+
+            awaitAdmissionPhase(state, admission.accept(finalProfile), timeout, unit);
+            ensureAdmissionActive(state);
+
+            final Player player = createPlayer(state.connection, finalProfile);
+            if (state.operation.isDone()) {
+                rollbackAdmission(state.connection);
+                return;
+            }
+
+            awaitAdmissionPhase(state, admission.prepare(player), timeout, unit);
+            ensureAdmissionActive(state);
+            transitionConfigToPlay(player);
+            state.operation.complete(player);
+        } catch (Throwable throwable) {
+            if (throwable instanceof InterruptedException) Thread.currentThread().interrupt();
+            state.operation.completeExceptionally(throwable);
+        }
+    }
+
+    private static void awaitAdmissionPhase(AdmissionState state, CompletableFuture<Void> phase,
+                                            long timeout, TimeUnit unit)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        Objects.requireNonNull(phase, "PlayerAdmission returned null");
+        if (!state.phase.compareAndSet(null, phase)) {
+            throw new IllegalStateException("Another admission phase is already active");
+        }
+        try {
+            if (state.operation.isDone()) {
+                phase.cancel(true);
+                throw new CancellationException("Player admission was cancelled");
+            }
+            phase.get(timeout, unit);
+        } catch (InterruptedException | TimeoutException exception) {
+            phase.cancel(true);
+            throw exception;
+        } finally {
+            state.phase.compareAndSet(phase, null);
+        }
+    }
+
+    private static void ensureAdmissionActive(AdmissionState state) {
+        if (state.operation.isDone() || !state.connection.isOnline()) {
+            throw new CancellationException("Connection closed during player admission");
+        }
+    }
+
+    private @Nullable Throwable rollbackAdmission(PlayerConnection connection) {
+        Throwable failure = null;
+        try {
+            if (connection.isOnline()) connection.kick(ADMISSION_FAILED_TEXT);
+        } catch (Throwable throwable) {
+            failure = throwable;
+            try {
+                connection.disconnect();
+            } catch (Throwable disconnectFailure) {
+                failure = combineFailures(failure, disconnectFailure);
+            }
+        }
+        try {
+            removePlayer(connection);
+        } catch (Throwable cleanupFailure) {
+            failure = combineFailures(failure, cleanupFailure);
+        }
+        try {
+            connection.setPlayer(null);
+        } catch (Throwable cleanupFailure) {
+            failure = combineFailures(failure, cleanupFailure);
+        }
+        return failure;
+    }
+
+    private static Throwable combineFailures(@Nullable Throwable first, Throwable second) {
+        if (first == null) return second;
+        if (first != second) first.addSuppressed(second);
+        return first;
+    }
+
+    @ApiStatus.Internal
+    public void cancelPlayerAdmission(PlayerConnection connection) {
+        final AdmissionState state = playerAdmissions.get(connection);
+        if (state != null) state.operation.cancel(true);
     }
 
     public void sendRegistryTags(Player player) {
@@ -211,11 +374,25 @@ public final class ConnectionManager {
             final int threshold = MinecraftServer.getCompressionThreshold();
             if (threshold > 0) socketConnection.startCompression();
         }
+        final GameProfile finalProfile = finalGameProfile(connection, gameProfile);
+        if (finalProfile == null) return gameProfile;
+        gameProfile = finalProfile;
+        // Publish the final profile before the client could possibly respond
+        if (connection instanceof PlayerSocketConnection socketConnection) {
+            socketConnection.UNSAFE_setProfile(gameProfile);
+        }
+        // Send login success packet (and switch to configuration phase)
+        connection.sendPacket(new LoginSuccessPacket(gameProfile, new UUID(0L, 0L)));
+        return gameProfile;
+    }
+
+    private static @Nullable GameProfile finalGameProfile(PlayerConnection connection,
+                                                           GameProfile gameProfile) {
         // Call pre login event
         LoginPluginMessageProcessor pluginMessageProcessor = connection.loginPluginMessageProcessor();
         AsyncPlayerPreLoginEvent asyncPlayerPreLoginEvent = new AsyncPlayerPreLoginEvent(connection, gameProfile, pluginMessageProcessor);
         EventDispatcher.call(asyncPlayerPreLoginEvent);
-        if (!connection.isOnline()) return gameProfile; // Player has been kicked
+        if (!connection.isOnline()) return null; // Player has been kicked
         // Change UUID/Username based on the event
         gameProfile = asyncPlayerPreLoginEvent.getGameProfile();
         // Wait for pending login plugin messages
@@ -225,12 +402,6 @@ public final class ConnectionManager {
             connection.kick(LoginListener.INVALID_PROXY_RESPONSE);
             throw new RuntimeException("Error getting replies for login plugin messages", t);
         }
-        // Publish the final profile before the client could possibly respond
-        if (connection instanceof PlayerSocketConnection socketConnection) {
-            socketConnection.UNSAFE_setProfile(gameProfile);
-        }
-        // Send login success packet (and switch to configuration phase)
-        connection.sendPacket(new LoginSuccessPacket(gameProfile, new UUID(0L, 0L)));
         return gameProfile;
     }
 
@@ -245,9 +416,15 @@ public final class ConnectionManager {
     @ApiStatus.Internal
     public void doConfiguration(Player player, boolean isFirstConfig) {
         assert ServerFlag.INSIDE_TEST || Thread.currentThread().isVirtual();
+        if (!player.isOnline()) return;
         if (isFirstConfig) {
             configurationPlayers.add(player);
             keepAlivePlayers.add(player);
+            if (!player.isOnline()) {
+                configurationPlayers.remove(player);
+                keepAlivePlayers.remove(player);
+                return;
+            }
         }
         player.sendPacket(PluginMessagePacket.brandPacket(MinecraftServer.getBrandName()));
         // Request known packs immediately, but don't wait for the response until required (sending registry data).
@@ -287,8 +464,17 @@ public final class ConnectionManager {
         }
 
         // Wait for pending resource packs if any
-        var packFuture = player.getResourcePackFuture();
-        if (packFuture != null) packFuture.join();
+        final var packFuture = player.getResourcePackFuture();
+        if (packFuture != null) {
+            try {
+                packFuture.get();
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException exception) {
+                throw new RuntimeException("Error receiving resource pack response", exception);
+            }
+        }
 
         keepAlivePlayers.remove(player);
         player.setPendingOptions(spawningInstance, event.isHardcore());
@@ -321,15 +507,38 @@ public final class ConnectionManager {
      * Shutdowns the connection manager by kicking all the currently connected players.
      */
     public synchronized void shutdown() {
+        acceptingAdmissions = false;
+        for (final AdmissionState state : List.copyOf(playerAdmissions.values())) {
+            try {
+                disconnectOnShutdown(state.connection);
+            } finally {
+                state.operation.cancel(true);
+            }
+        }
         for (final PlayerConnection configPlayer : connectionPlayerMap.keySet())
-            configPlayer.kick(SHUTDOWN_TEXT);
+            disconnectOnShutdown(configPlayer);
         this.configurationPlayers.clear();
         for (final Player playPlayer : playPlayers)
-            playPlayer.kick(SHUTDOWN_TEXT);
+            disconnectOnShutdown(playPlayer.getPlayerConnection());
         this.playPlayers.clear();
 
         this.keepAlivePlayers.clear();
         this.connectionPlayerMap.clear();
+    }
+
+    private static void disconnectOnShutdown(PlayerConnection connection) {
+        if (!connection.isOnline()) return;
+        try {
+            connection.kick(SHUTDOWN_TEXT);
+        } catch (Throwable throwable) {
+            LOGGER.error("Failed to kick connection during shutdown", throwable);
+            try {
+                connection.disconnect();
+            } catch (Throwable disconnectFailure) {
+                if (throwable != disconnectFailure) throwable.addSuppressed(disconnectFailure);
+                LOGGER.error("Failed to disconnect connection during shutdown", disconnectFailure);
+            }
+        }
     }
 
     public void tick(long tickStart) {
@@ -390,6 +599,29 @@ public final class ConnectionManager {
             } else if (lastKeepAlive >= TimeUnit.MILLISECONDS.toNanos(ServerFlag.KEEP_ALIVE_KICK)) {
                 player.kick(TIMEOUT_TEXT);
             }
+        }
+    }
+
+    private static final class AdmissionState {
+        private final PlayerConnection connection;
+        private final CompletableFuture<Player> operation = new CompletableFuture<>();
+        private final CompletableFuture<Player> result = new CompletableFuture<>() {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                if (!operation.cancel(mayInterruptIfRunning)) return false;
+                super.cancel(mayInterruptIfRunning);
+                return true;
+            }
+        };
+        private final AtomicReference<CompletableFuture<Void>> phase = new AtomicReference<>();
+
+        private AdmissionState(PlayerConnection connection) {
+            this.connection = connection;
+        }
+
+        private void cancelPhase() {
+            final CompletableFuture<Void> current = phase.getAndSet(null);
+            if (current != null) current.cancel(true);
         }
     }
 

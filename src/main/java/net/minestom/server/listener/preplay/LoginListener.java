@@ -9,6 +9,7 @@ import net.minestom.server.MinecraftServer;
 import net.minestom.server.entity.Player;
 import net.minestom.server.extras.mojangAuth.MojangCrypt;
 import net.minestom.server.network.NetworkBuffer;
+import net.minestom.server.network.PlayerAdmission;
 import net.minestom.server.network.packet.client.configuration.ClientFinishConfigurationPacket;
 import net.minestom.server.network.packet.client.configuration.ClientSelectKnownPacksPacket;
 import net.minestom.server.network.packet.client.login.ClientEncryptionResponsePacket;
@@ -17,6 +18,7 @@ import net.minestom.server.network.packet.client.login.ClientLoginPluginResponse
 import net.minestom.server.network.packet.client.login.ClientLoginStartPacket;
 import net.minestom.server.network.packet.client.play.ClientConfigurationAckPacket;
 import net.minestom.server.network.packet.server.login.EncryptionRequestPacket;
+import net.minestom.server.network.packet.server.login.LoginSuccessPacket;
 import net.minestom.server.network.player.GameProfile;
 import net.minestom.server.network.player.PlayerConnection;
 import net.minestom.server.network.player.PlayerSocketConnection;
@@ -36,12 +38,18 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static net.minestom.server.network.NetworkBuffer.STRING;
 
 public final class LoginListener {
     private static final SecureRandom NONCE_RANDOM = new SecureRandom();
+    private static final Map<PlayerConnection, JavaPlayerAdmission> PLAYER_ADMISSIONS =
+            new ConcurrentHashMap<>();
 
     private static final Component ALREADY_CONNECTED = Component.text("You are already on this server", NamedTextColor.RED);
     private static final Component ERROR_DURING_LOGIN = Component.text("Error during login!", NamedTextColor.RED);
@@ -208,15 +216,12 @@ public final class LoginListener {
     public static void loginAckListener(ClientLoginAcknowledgedPacket ignored, PlayerConnection connection) {
         if (!(connection instanceof PlayerSocketConnection socketConnection))
             throw new UnsupportedOperationException("Only socket");
-        final GameProfile gameProfile = socketConnection.gameProfile();
-        assert gameProfile != null;
-        try {
-            final Player player = MinecraftServer.getConnectionManager().createPlayer(connection, gameProfile);
-            executeConfig(player, true);
-        } catch (Throwable t) {
-            MinecraftServer.getExceptionManager().handleException(t);
+        final JavaPlayerAdmission admission = PLAYER_ADMISSIONS.get(socketConnection);
+        if (admission == null) {
             connection.kick(ERROR_DURING_LOGIN);
+            return;
         }
+        admission.loginAcknowledged.complete(null);
     }
 
     public static void configAckListener(ClientConfigurationAckPacket packet, Player player) {
@@ -228,15 +233,28 @@ public final class LoginListener {
     }
 
     public static void finishConfigListener(ClientFinishConfigurationPacket packet, Player player) {
+        final JavaPlayerAdmission admission = PLAYER_ADMISSIONS.get(player.getPlayerConnection());
+        if (admission != null && admission.preparation.complete(null)) return;
         MinecraftServer.getConnectionManager().transitionConfigToPlay(player);
     }
 
     private static void enterConfig(PlayerConnection connection, GameProfile gameProfile) {
-        Thread.startVirtualThread(() -> {
-            try {
-                MinecraftServer.getConnectionManager().transitionLoginToConfig(connection, gameProfile);
-            } catch (Throwable t) {
-                MinecraftServer.getExceptionManager().handleException(t);
+        if (!(connection instanceof PlayerSocketConnection socketConnection))
+            throw new UnsupportedOperationException("Only socket");
+        final int threshold = MinecraftServer.getCompressionThreshold();
+        if (threshold > 0) socketConnection.startCompression();
+
+        final JavaPlayerAdmission admission = new JavaPlayerAdmission(socketConnection);
+        if (PLAYER_ADMISSIONS.putIfAbsent(connection, admission) != null) {
+            connection.kick(ERROR_DURING_LOGIN);
+            return;
+        }
+        final CompletableFuture<Player> result =
+                MinecraftServer.getConnectionManager().admitPlayer(connection, gameProfile, admission);
+        var _ = result.whenComplete((_, throwable) -> {
+            PLAYER_ADMISSIONS.remove(connection, admission);
+            if (throwable != null && !(throwable instanceof CancellationException)) {
+                MinecraftServer.getExceptionManager().handleException(throwable);
             }
         });
     }
@@ -253,5 +271,39 @@ public final class LoginListener {
                 player.kick(ERROR_DURING_LOGIN);
             }
         });
+    }
+
+    private static final class JavaPlayerAdmission implements PlayerAdmission {
+        private final PlayerSocketConnection connection;
+        private final CompletableFuture<Void> loginAcknowledged = new CompletableFuture<>();
+        private final CompletableFuture<Void> preparation = new CompletableFuture<>();
+
+        private JavaPlayerAdmission(PlayerSocketConnection connection) {
+            this.connection = connection;
+        }
+
+        @Override
+        public CompletableFuture<Void> accept(GameProfile gameProfile) {
+            connection.UNSAFE_setProfile(gameProfile);
+            connection.sendPacket(new LoginSuccessPacket(gameProfile, new UUID(0L, 0L)));
+            return loginAcknowledged;
+        }
+
+        @Override
+        public CompletableFuture<Void> prepare(Player player) {
+            final Thread thread = Thread.ofVirtual().unstarted(() -> {
+                if (preparation.isDone() || !player.isOnline()) return;
+                try {
+                    MinecraftServer.getConnectionManager().doConfiguration(player, true);
+                } catch (Throwable throwable) {
+                    preparation.completeExceptionally(throwable);
+                }
+            });
+            var _ = preparation.whenComplete((_, _) -> {
+                if (preparation.isCancelled()) thread.interrupt();
+            });
+            thread.start();
+            return preparation;
+        }
     }
 }

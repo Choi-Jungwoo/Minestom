@@ -871,7 +871,7 @@ public class Player extends LivingEntity implements CommandSender, HoverEventSou
                 var chunk = instance.getChunk(chunkX, chunkZ);
                 if (chunk == null || !chunk.isLoaded()) continue;
 
-                sendPacket(chunk.getFullDataPacket());
+                playerConnection.sendChunk(chunk);
                 EventDispatcher.call(new PlayerChunkLoadEvent(this, chunkX, chunkZ));
 
                 pendingChunkCount -= 1f;
